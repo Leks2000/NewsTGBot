@@ -164,7 +164,7 @@ async def ai_select_and_summarize(news_list: list) -> dict:
         async with aiohttp.ClientSession() as s:
             headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
             payload = {
-                "model": "llama-3.3-70b-versatile",
+                "model": "llama-3.1-70b-versatile",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.8,
                 "max_tokens": 300,
@@ -203,7 +203,7 @@ async def ai_select_and_summarize(news_list: list) -> dict:
                 "X-Title": "News Bot"
             }
             payload = {
-                "model": "mistralai/mistral-large-2411",
+                "model": "meta-llama/llama-3.1-8b-instruct:free",
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.8,
                 "max_tokens": 400
@@ -396,92 +396,236 @@ async def news_loop():
 
 # ================== YOUTUBE ==================
 async def parse_youtube_trending():
+    """Парсит топ-20 из YouTube Trending"""
     url = "https://www.youtube.com/feed/trending?gl=RU&hl=ru"
+    
     try:
+        log.info("🎬 Парсинг YouTube Trending...")
+        
         async with aiohttp.ClientSession() as s:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Language": "ru-RU,ru;q=0.9"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             }
-            async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            
+            async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
                 if r.status != 200:
+                    log.error(f"❌ YouTube HTTP {r.status}")
                     return []
+                
                 html = await r.text()
-                match = re.search(r'var ytInitialData = ({.*?});', html)
+                
+                # Ищем ytInitialData
+                match = re.search(r'var ytInitialData = ({.+?});', html, re.DOTALL)
                 if not match:
-                    return []
-                data = json.loads(match.group(1))
-                videos = []
+                    log.error("❌ Не найден ytInitialData в HTML")
+                    # Попробуем альтернативный способ
+                    match = re.search(r'window\["ytInitialData"\] = ({.+?});', html, re.DOTALL)
+                    if not match:
+                        log.error("❌ Альтернативный поиск также провалился")
+                        return []
+                
                 try:
+                    data = json.loads(match.group(1))
+                except json.JSONDecodeError as e:
+                    log.error(f"❌ JSON parse error: {e}")
+                    return []
+                
+                videos = []
+                
+                try:
+                    # Навигация по структуре данных
                     tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
+                    
                     for tab in tabs:
-                        if "tabRenderer" in tab:
-                            content = tab["tabRenderer"].get("content", {})
-                            section = content.get("richGridRenderer", {}).get("contents", [])
-                            for item in section:
-                                if "richItemRenderer" in item:
-                                    video_data = item["richItemRenderer"]["content"]["videoRenderer"]
-                                    video_id = video_data.get("videoId")
-                                    title = video_data.get("title", {}).get("runs", [{}])[0].get("text", "")
-                                    views = video_data.get("viewCountText", {}).get("simpleText", "0")
-                                    length = video_data.get("lengthText", {}).get("simpleText", "")
-                                    if video_id and title:
-                                        videos.append({
-                                            "id": video_id, "title": title, "views": views,
-                                            "length": length, "url": f"https://www.youtube.com/watch?v={video_id}"
-                                        })
-                except:
-                    pass
+                        if "tabRenderer" not in tab:
+                            continue
+                        
+                        content = tab["tabRenderer"].get("content", {})
+                        
+                        # Ищем richGridRenderer или sectionListRenderer
+                        if "richGridRenderer" in content:
+                            items = content["richGridRenderer"].get("contents", [])
+                        elif "sectionListRenderer" in content:
+                            sections = content["sectionListRenderer"].get("contents", [])
+                            items = []
+                            for section in sections:
+                                if "itemSectionRenderer" in section:
+                                    items.extend(section["itemSectionRenderer"].get("contents", []))
+                        else:
+                            continue
+                        
+                        for item in items:
+                            # Пропускаем рекламу и продолжения
+                            if "richItemRenderer" not in item:
+                                continue
+                            
+                            try:
+                                video_data = item["richItemRenderer"]["content"]["videoRenderer"]
+                                
+                                video_id = video_data.get("videoId")
+                                if not video_id:
+                                    continue
+                                
+                                # Заголовок
+                                title_data = video_data.get("title", {})
+                                if "runs" in title_data:
+                                    title = title_data["runs"][0].get("text", "")
+                                else:
+                                    title = title_data.get("simpleText", "")
+                                
+                                if not title:
+                                    continue
+                                
+                                # Просмотры
+                                views_data = video_data.get("viewCountText", {})
+                                views = views_data.get("simpleText", "0")
+                                
+                                # Длительность
+                                length_data = video_data.get("lengthText", {})
+                                length = length_data.get("simpleText", "")
+                                
+                                videos.append({
+                                    "id": video_id,
+                                    "title": title,
+                                    "views": views,
+                                    "length": length,
+                                    "url": f"https://www.youtube.com/watch?v={video_id}"
+                                })
+                                
+                            except KeyError as e:
+                                log.debug(f"Пропускаю item: {e}")
+                                continue
+                
+                except KeyError as e:
+                    log.error(f"❌ Ошибка структуры данных: {e}")
+                    return []
+                
+                log.info(f"✅ Найдено {len(videos)} видео")
                 return videos[:20]
+                
+    except asyncio.TimeoutError:
+        log.error("❌ YouTube timeout")
+        return []
     except Exception as e:
-        log.error(f"YouTube error: {e}")
+        log.error(f"❌ YouTube error: {type(e).__name__}: {e}")
         return []
 
+
 def is_short_video(length_str: str):
+    """Определяет, является ли видео Shorts (<60 сек)"""
     if not length_str:
         return False
+    
     try:
         parts = length_str.split(":")
-        if len(parts) == 2:
+        
+        if len(parts) == 1:
+            # Формат "45" (секунды)
+            return int(parts[0]) < 60
+        elif len(parts) == 2:
+            # Формат "0:45" (минуты:секунды)
             m, s = map(int, parts)
             return m == 0 and s < 60
-        elif len(parts) == 1:
-            return int(parts[0]) < 60
-    except:
+        elif len(parts) == 3:
+            # Формат "0:00:45" (часы:минуты:секунды)
+            h, m, s = map(int, parts)
+            return h == 0 and m == 0 and s < 60
+    except ValueError:
         pass
+    
     return False
 
+
 async def post_youtube_tops():
+    """Постит топ полное видео + топ Shorts"""
+    log.info("🎬 Запуск задачи YouTube топов...")
+    
+    # Парсим trending
     videos = await parse_youtube_trending()
+    
     if not videos:
+        log.warning("⚠️ Не удалось получить видео из YouTube")
         return
     
+    # Разделяем на полные видео и Shorts
     full_videos = [v for v in videos if not is_short_video(v.get("length", ""))]
     short_videos = [v for v in videos if is_short_video(v.get("length", ""))]
     
-    top_full = next((v for v in full_videos if not is_youtube_posted_today(v["id"])), None)
-    top_short = next((v for v in short_videos if not is_youtube_posted_today(v["id"])), None)
+    log.info(f"📊 Полных видео: {len(full_videos)}, Shorts: {len(short_videos)}")
     
+    # Ищем неопубликованные
+    top_full = None
+    for v in full_videos:
+        if not is_youtube_posted_today(v["id"]):
+            top_full = v
+            break
+    
+    top_short = None
+    for v in short_videos:
+        if not is_youtube_posted_today(v["id"]):
+            top_short = v
+            break
+    
+    # Постим полное видео
     if top_full:
         try:
-            caption = f"🔥 **Самое популярное видео сегодня в РФ**\n\n{top_full['title']}\n\n👀 {top_full['views']}\n\n{top_full['url']}"
-            await bot.send_message(CHANNEL_ID, caption, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
+            log.info(f"📤 Отправляю топ видео: {top_full['title'][:50]}...")
+            
+            caption = (
+                f"🔥 **Самое популярное видео сегодня в РФ**\n\n"
+                f"{top_full['title']}\n\n"
+                f"👀 {top_full['views']}\n\n"
+                f"{top_full['url']}"
+            )
+            
+            await bot.send_message(
+                CHANNEL_ID, 
+                caption, 
+                parse_mode=ParseMode.MARKDOWN, 
+                disable_web_page_preview=False
+            )
+            
             save_youtube_posted(top_full['id'], 'full')
-            log.info("✅ YouTube топ")
+            log.info("✅ YouTube топ видео опубликовано")
+            
         except Exception as e:
-            log.error(f"YouTube error: {e}")
+            log.error(f"❌ Ошибка отправки топ видео: {e}")
+    else:
+        log.info("ℹ️ Топ видео уже опубликовано сегодня")
     
-    await asyncio.sleep(3)
+    # Пауза между постами
+    await asyncio.sleep(5)
     
+    # Постим Shorts
     if top_short:
         try:
-            caption = f"⚡ **Самый популярный Shorts сегодня**\n\n{top_short['title']}\n\n👀 {top_short['views']}\n\n{top_short['url']}"
-            await bot.send_message(CHANNEL_ID, caption, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=False)
+            log.info(f"📤 Отправляю топ Shorts: {top_short['title'][:50]}...")
+            
+            caption = (
+                f"⚡ **Самый популярный Shorts сегодня**\n\n"
+                f"{top_short['title']}\n\n"
+                f"👀 {top_short['views']}\n\n"
+                f"{top_short['url']}"
+            )
+            
+            await bot.send_message(
+                CHANNEL_ID, 
+                caption, 
+                parse_mode=ParseMode.MARKDOWN, 
+                disable_web_page_preview=False
+            )
+            
             save_youtube_posted(top_short['id'], 'shorts')
-            log.info("✅ YouTube shorts")
+            log.info("✅ YouTube Shorts опубликован")
+            
         except Exception as e:
-            log.error(f"YouTube error: {e}")
-
+            log.error(f"❌ Ошибка отправки Shorts: {e}")
+    else:
+        log.info("ℹ️ Топ Shorts уже опубликован сегодня")
+    
+    log.info("🎬 Задача YouTube топов завершена")
 async def main():
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(post_youtube_tops, "cron", hour=19, minute=0)
