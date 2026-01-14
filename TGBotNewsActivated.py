@@ -16,8 +16,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================== CONFIG ==================
 BOT_TOKEN = '7885944156:AAHrh2o1UPzJ67jviCULfOmP_BGPExdh6l8'
-GROQ_API_KEY = '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'
-OPENROUTER_API_KEY = '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'
+GROQ_API_KEY = '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'
+OPENROUTER_API_KEY = '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'
 CHANNEL_ID = '@bulmyash'
 TIMEZONE = "Europe/Moscow"
 
@@ -190,55 +190,76 @@ async def ai_select_and_summarize(news_list: list) -> dict:
                         return selected_news
                 elif r.status == 429:
                     log.warning("⚠️ Groq rate limit")
+                else:
+                    log.warning(f"⚠️ Groq HTTP {r.status}")
     except Exception as e:
         log.warning(f"⚠️ Groq failed: {e}")
     
-    # 2️⃣ OPENROUTER
-    try:
-        async with aiohttp.ClientSession() as s:
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/news-bot",
-                "X-Title": "News Bot"
-            }
-            payload = {
-                "model": "meta-llama/llama-3.1-8b-instruct:free",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.8,
-                "max_tokens": 400
-            }
-            async with s.post("https://openrouter.ai/api/v1/chat/completions",
-                            headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    content = data["choices"][0]["message"]["content"].strip()
-                    
-                    # Агрессивная очистка
-                    json_start = content.find('{')
-                    json_end = content.rfind('}')
-                    if json_start != -1 and json_end != -1:
-                        content = content[json_start:json_end+1]
-                    content = re.sub(r'```(?:json)?\s*|\s*```', '', content).strip()
-                    
-                    result = json.loads(content)
-                    selected_idx = int(result.get("selected", 1)) - 1
-                    
-                    if 0 <= selected_idx < len(news_list):
-                        selected_news = news_list[selected_idx]
-                        selected_news.update({
-                            "summary": result.get("summary", ""),
-                            "hashtags": result.get("hashtags", "")
-                        })
-                        log.info(f"✅ AI: OpenRouter выбрал #{selected_idx+1}")
-                        return selected_news
-                else:
-                    log.error(f"OpenRouter HTTP {r.status}")
-    except Exception as e:
-        log.warning(f"⚠️ OpenRouter failed: {e}")
+    # 2️⃣ OPENROUTER (обновленные модели)
+    models_to_try = [
+        "google/gemini-2.0-flash-exp:free",  # Новая бесплатная модель Google
+        "meta-llama/llama-3.2-3b-instruct:free",  # Обновленная Llama
+        "qwen/qwen-2-7b-instruct:free",  # Альтернатива
+    ]
     
-    log.error("❌ Все AI недоступны")
-    return None
+    for model in models_to_try:
+        try:
+            async with aiohttp.ClientSession() as s:
+                headers = {
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/news-bot",
+                    "X-Title": "News Bot"
+                }
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.8,
+                    "max_tokens": 400
+                }
+                async with s.post("https://openrouter.ai/api/v1/chat/completions",
+                                headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        content = data["choices"][0]["message"]["content"].strip()
+                        
+                        # Агрессивная очистка
+                        json_start = content.find('{')
+                        json_end = content.rfind('}')
+                        if json_start != -1 and json_end != -1:
+                            content = content[json_start:json_end+1]
+                        content = re.sub(r'```(?:json)?\s*|\s*```', '', content).strip()
+                        
+                        result = json.loads(content)
+                        selected_idx = int(result.get("selected", 1)) - 1
+                        
+                        if 0 <= selected_idx < len(news_list):
+                            selected_news = news_list[selected_idx]
+                            selected_news.update({
+                                "summary": result.get("summary", ""),
+                                "hashtags": result.get("hashtags", "")
+                            })
+                            log.info(f"✅ AI: OpenRouter ({model}) выбрал #{selected_idx+1}")
+                            return selected_news
+                    elif r.status == 404:
+                        log.warning(f"⚠️ Модель {model} не найдена, пробую следующую...")
+                        continue
+                    else:
+                        error_text = await r.text()
+                        log.warning(f"⚠️ OpenRouter ({model}) HTTP {r.status}: {error_text[:200]}")
+                        continue
+        except Exception as e:
+            log.warning(f"⚠️ OpenRouter ({model}) failed: {e}")
+            continue
+    
+    # 3️⃣ FALLBACK: простой выбор случайной новости
+    log.warning("⚠️ Все AI недоступны, выбираю случайную новость")
+    selected = random.choice(news_list[:10])
+    selected.update({
+        "summary": selected["desc"][:200] if selected["desc"] else selected["title"],
+        "hashtags": "#новости #россия #мир"
+    })
+    return selected
 
 # ================== СБОР НОВОСТЕЙ ==================
 async def collect_fresh_news(limit=30):
@@ -385,8 +406,8 @@ async def check_news():
 
 async def news_loop():
     """Постинг каждые 20-70 мин"""
-    log.info("⏰ Первый пост через 3 мин...")
-    await asyncio.sleep(3 * 60)
+    log.info("⏰ Первый пост через 5 секунд...")
+    await asyncio.sleep(1 * 5)
     
     while True:
         await check_news()
@@ -626,6 +647,7 @@ async def post_youtube_tops():
         log.info("ℹ️ Топ Shorts уже опубликован сегодня")
     
     log.info("🎬 Задача YouTube топов завершена")
+
 async def main():
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(post_youtube_tops, "cron", hour=19, minute=0)

@@ -1,18 +1,31 @@
 import asyncio
 import aiohttp
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+import re
+import os
+import sys
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.types import BufferedInputFile
 
 # ================== CONFIG ==================
 BOT_TOKEN = '7885944156:AAHrh2o1UPzJ67jviCULfOmP_BGPExdh6l8'
 YOUTUBE_API_KEY = 'AIzaSyBVSJaPPKL_wzfc9iU38YEM8MxjUt3lZZk'
 CHANNEL_ID = '@bulmyash'
 
+# Определяем папку для скачивания (Windows/Linux)
+if sys.platform == "win32":
+    TEMP_DIR = "C:/temp/shorts"
+else:
+    TEMP_DIR = "/tmp/shorts"
+
+# Создаём папку если нет
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-log = logging.getLogger("youtube_api")
+log = logging.getLogger("yt_news_shorts")
 bot = Bot(BOT_TOKEN)
 
 # ================== БАЗА ДАННЫХ ==================
@@ -37,178 +50,101 @@ def save_youtube_posted(video_id, video_type):
               (video_id, datetime.now().isoformat(), video_type))
     conn.commit()
 
-# ================== НОВОСТНЫЕ РУССКОЯЗЫЧНЫЕ КАНАЛЫ ==================
-RUSSIAN_CHANNELS = [
-    # Новости и политика (ПРИОРИТЕТ)
-    "UCMCgOm8GZkHp8zJ6l7_hIuA",  # вДудь
-    "UCHIJ5zaY0WzX3N9LZYjUwBg",  # Мир 24
-    "UCjN1IYtqJ-u1KLPa-UtlzOA",  # RT Russian
-    "UCuqVG3sNARAMZY5ddJSRO2A",  # ДЕНЬ ТВ
-    "UC_wRgdKWVcz1dwnBqfXK_-g",  # Кремль
-    "UCMkIm7hI9oOPb3CUIOyfnhQ",  # varlamov (урбанистика)
-    "UCrDVws_483jJq4xYbgYudKw",  # А поговорить?
-    "UCh6SzS3eqGw-IMU9-rf6RJw",  # Редакция
-    "UCknKb2QJL0LLm5MkQAhBlCQ",  # Popular Politics
-    "UCQwJI3H6_WxAdKN8tGmb-Vw",  # Навальный LIVE
+# ================== УЛУЧШЕННЫЕ ФИЛЬТРЫ РУ КОНТЕНТА ==================
+def has_cyrillic(text):
+    """Проверяет наличие кириллицы в тексте"""
+    return bool(re.search('[а-яА-ЯёЁ]', text))
+
+def has_ukrainian(text):
+    """Проверяет наличие украинских букв"""
+    ukrainian_letters = ['є', 'і', 'ї', 'ґ', 'Є', 'І', 'Ї', 'Ґ']
+    return any(letter in text for letter in ukrainian_letters)
+
+def is_russian_content(title, channel_title, description=""):
+    """ЖЁСТКАЯ проверка ТОЛЬКО РУ контента"""
+    full_text = f"{title} {channel_title} {description}".lower()
     
-    # Экономика и аналитика
-    "UCU1eNBVq9lwKb76qJPf3ksw",  # Популярная экономика
-    "UCEU6OjJUdT6gkRJTMCa8C5w",  # Экономика просто
+    # БЛОК 1: Обязательно должна быть русская кириллица
+    if not has_cyrillic(title + channel_title):
+        return False
     
-    # Международные новости на русском
-    "UC101o-vQ2iOj5ytnlSloweredWY7g",  # НАРОД ПРОТИВ
+    # БЛОК 2: Украинский язык - ЗАПРЕЩЁН
+    if has_ukrainian(title + channel_title + description):
+        log.debug(f"   ❌ Украинский язык: {title[:40]}")
+        return False
+    
+    # БЛОК 3: Украинские ключевые слова
+    ua_keywords = [
+        'україн', 'ukrainian', 'kiev', 'kyiv', 'київ', 'зеленськ', 
+        'zelensky', 'азов', 'azov', 'всу', 'afu', 'зсу'
+    ]
+    if any(kw in full_text for kw in ua_keywords):
+        log.debug(f"   ❌ Украинский контент: {title[:40]}")
+        return False
+    
+    # БЛОК 4: Исключаем другие алфавиты
+    bad_patterns = [
+        r'[\u0600-\u06FF]',  # Арабский
+        r'[\u0900-\u097F]',  # Хинди
+        r'[\u4E00-\u9FFF]',  # Китайский
+        r'[\u3040-\u309F]',  # Японский (хирагана)
+        r'[\u30A0-\u30FF]',  # Японский (катакана)
+        r'[\uAC00-\uD7AF]',  # Корейский
+    ]
+    
+    for pattern in bad_patterns:
+        if re.search(pattern, title + channel_title):
+            return False
+    
+    return True
+
+# ================== БЕЛЫЙ СПИСОК РУ НОВОСТНЫХ КАНАЛОВ ==================
+RU_NEWS_CHANNELS = [
+    # ОСНОВНЫЕ НОВОСТИ
+    "РИА Новости", "ТАСС", "Известия", "Интерфакс", 
+    "РБК", "Коммерсантъ", "Ведомости", "Фонтанка",
+    
+    # ТВ КАНАЛЫ
+    "Первый канал", "Россия 24", "НТВ", "Мир 24",
+    "RT", "ДЕНЬ ТВ", "360°", "Звезда",
+    
+    # ОФИЦИАЛЬНЫЕ
+    "Кремль", "Правительство РФ", "БелТА",
+    
+    # НЕЗАВИСИМЫЕ
+    "Дождь", "Настоящее Время", "Редакция", "Медуза",
+    
+    # АНАЛИТИКА/БЛОГЕРЫ
+    "вДудь", "Навальный LIVE", "Популярная политика",
+    "НАРОД ПРОТИВ", "MetaPulsee", "А поговорить",
+    "ФЕЙГИН LIVE", "Екатерина Шульман",
+    
+    # РЕГИОНАЛЬНЫЕ
+    "Москва 24", "Санкт-Петербург", "Новости Урала",
 ]
 
-# ================== YOUTUBE API ==================
-async def get_trending_videos():
-    """Получает топ 50 популярных видео в РФ"""
-    log.info("🎬 Запрос к YouTube Data API v3 (регион: RU)...")
-    
-    url = "https://www.googleapis.com/youtube/v3/videos"
-    params = {
-        "part": "snippet,contentDetails,statistics",
-        "chart": "mostPopular",
-        "regionCode": "RU",
-        "maxResults": 50,
-        "key": YOUTUBE_API_KEY
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    log.error(f"❌ YouTube API HTTP {response.status}: {error_text[:200]}")
-                    return []
-                
-                data = await response.json()
-                
-                if "error" in data:
-                    log.error(f"❌ YouTube API error: {data['error']['message']}")
-                    return []
-                
-                items = data.get("items", [])
-                log.info(f"✅ Получено {len(items)} видео из trending")
-                
-                videos = []
-                for item in items:
-                    try:
-                        video_id = item["id"]
-                        snippet = item["snippet"]
-                        stats = item["statistics"]
-                        content = item["contentDetails"]
-                        
-                        # Фильтруем только русскоязычные видео
-                        channel_id = snippet["channelId"]
-                        default_lang = snippet.get("defaultAudioLanguage", "")
-                        
-                        # Пропускаем нерусский контент
-                        if default_lang and default_lang not in ["ru", "ru-RU"]:
-                            continue
-                        
-                        duration = content["duration"]
-                        is_short = parse_duration(duration)
-                        
-                        videos.append({
-                            "id": video_id,
-                            "title": snippet["title"],
-                            "channel": snippet["channelTitle"],
-                            "channel_id": channel_id,
-                            "views": int(stats.get("viewCount", 0)),
-                            "likes": int(stats.get("likeCount", 0)),
-                            "duration": duration,
-                            "is_short": is_short,
-                            "url": f"https://www.youtube.com/watch?v={video_id}"
-                        })
-                    except Exception as e:
-                        continue
-                
-                log.info(f"✅ Отфильтровано {len(videos)} русскоязычных видео")
-                return videos
-                
-    except Exception as e:
-        log.error(f"❌ API request error: {e}")
-        return []
+def is_trusted_news_channel(channel_title):
+    """Проверяет что канал в белом списке НОВОСТНЫХ"""
+    channel_lower = channel_title.lower()
+    return any(trusted.lower() in channel_lower for trusted in RU_NEWS_CHANNELS)
 
-
-async def search_popular_shorts():
-    """Ищет популярные НАСТОЯЩИЕ Shorts на русских каналах"""
-    log.info("🔍 Ищу популярные Shorts на русских каналах...")
+def is_news_content(title, description=""):
+    """Проверяет что контент действительно новостной"""
+    news_keywords = [
+        'новост', 'сегодня', 'срочн', 'путин', 'россия', 'рф',
+        'правительств', 'госдум', 'президент', 'политик',
+        'война', 'украин', 'санкц', 'экономик', 'указ',
+        'заявил', 'объявил', 'сообщил', 'произошл'
+    ]
     
-    all_shorts = []
+    text = f"{title} {description}".lower()
+    matches = sum(1 for kw in news_keywords if kw in text)
     
-    for channel_id in RUSSIAN_CHANNELS[:10]:
-        try:
-            # Ищем ТОЛЬКО Shorts (videoDuration=short)
-            url = "https://www.googleapis.com/youtube/v3/search"
-            params = {
-                "part": "id",
-                "channelId": channel_id,
-                "maxResults": 10,
-                "order": "viewCount",
-                "publishedAfter": (datetime.now() - timedelta(days=3)).isoformat() + "Z",  # За 3 дня
-                "type": "video",
-                "videoDuration": "short",  # ТОЛЬКО короткие (<4 мин)
-                "key": YOUTUBE_API_KEY
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status != 200:
-                        continue
-                    
-                    data = await response.json()
-                    video_ids = [item["id"]["videoId"] for item in data.get("items", [])]
-                    
-                    if not video_ids:
-                        continue
-                    
-                    # Получаем детали
-                    details_url = "https://www.googleapis.com/youtube/v3/videos"
-                    details_params = {
-                        "part": "snippet,statistics,contentDetails",
-                        "id": ",".join(video_ids),
-                        "key": YOUTUBE_API_KEY
-                    }
-                    
-                    async with session.get(details_url, params=details_params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status != 200:
-                            continue
-                        
-                        details_data = await resp.json()
-                        
-                        for item in details_data.get("items", []):
-                            duration = item["contentDetails"]["duration"]
-                            total_sec = parse_duration_to_seconds(duration)
-                            
-                            # СТРОГИЙ ФИЛЬТР: только 10-60 секунд
-                            if 10 <= total_sec <= 60:
-                                all_shorts.append({
-                                    "id": item["id"],
-                                    "title": item["snippet"]["title"],
-                                    "channel": item["snippet"]["channelTitle"],
-                                    "channel_id": item["snippet"]["channelId"],
-                                    "views": int(item["statistics"].get("viewCount", 0)),
-                                    "likes": int(item["statistics"].get("likeCount", 0)),
-                                    "duration": duration,
-                                    "is_short": True,
-                                    "url": f"https://youtube.com/shorts/{item['id']}"  # Shorts URL!
-                                })
-            
-            await asyncio.sleep(0.1)
-            
-        except Exception as e:
-            log.debug(f"Ошибка канала {channel_id}: {e}")
-            continue
-    
-    log.info(f"✅ Найдено {len(all_shorts)} настоящих Shorts")
-    return all_shorts
+    return matches >= 1  # Минимум 1 новостное слово
 
-
+# ================== ПАРСИНГ ДЛИТЕЛЬНОСТИ ==================
 def parse_duration_to_seconds(iso_duration):
-    """Парсит ISO 8601 в секунды"""
-    import re
-    
+    """Парсит ISO 8601 (PT1M30S) в секунды"""
     pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
     match = re.match(pattern, iso_duration)
     
@@ -221,29 +157,8 @@ def parse_duration_to_seconds(iso_duration):
     
     return hours * 3600 + minutes * 60 + seconds
 
-
-def parse_duration(iso_duration):
-    """Парсит ISO 8601 и определяет Shorts (строго 5-59 сек)"""
-    import re
-    
-    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
-    match = re.match(pattern, iso_duration)
-    
-    if not match:
-        return False
-    
-    hours = int(match.group(1) or 0)
-    minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
-    
-    total_seconds = hours * 3600 + minutes * 60 + seconds
-    
-    # Shorts - это видео от 5 до 59 секунд (не реклама 0-5 сек)
-    return 5 <= total_seconds <= 59
-
-
 def format_views(views):
-    """Форматирует просмотры"""
+    """Форматирует просмотры (1500000 -> 1.5М)"""
     if views >= 1_000_000:
         return f"{views / 1_000_000:.1f}М"
     elif views >= 1_000:
@@ -251,281 +166,366 @@ def format_views(views):
     else:
         return str(views)
 
-
-async def download_youtube_video(video_id):
-    """Скачивает YouTube видео через несколько методов"""
+# ================== ПОИСК НОВОСТНЫХ SHORTS ==================
+async def search_news_shorts():
+    """Ищет популярные РУССКИЕ новостные Shorts"""
+    log.info("🔍 Поиск РУССКИХ новостных Shorts...")
     
-    # Метод 1: y2mate API (быстрый)
-    try:
-        log.info("   Пробую y2mate...")
-        async with aiohttp.ClientSession() as session:
-            # Получаем инфу о видео
-            api_url = f"https://www.y2mate.com/mates/analyzeV2/ajax"
-            data = {
-                "k_query": f"https://www.youtube.com/watch?v={video_id}",
-                "k_page": "home",
-                "hl": "en",
-                "q_auto": 0
+    all_shorts = []
+    
+    # ТОЛЬКО русские поисковые запросы
+    news_queries = [
+        "новости россии",
+        "политика путин",
+        "россия сегодня",
+        "кремль заявил"
+    ]
+    
+    for query in news_queries[:3]:
+        try:
+            log.info(f"   Поиск: '{query}'...")
+            
+            url = "https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "part": "id,snippet",
+                "q": query + " shorts",
+                "type": "video",
+                "maxResults": 30,
+                "order": "viewCount",
+                "publishedAfter": (datetime.now() - timedelta(days=2)).isoformat() + "Z",
+                "regionCode": "RU",
+                "relevanceLanguage": "ru",
+                "videoCategoryId": "25",  # News & Politics
+                "key": YOUTUBE_API_KEY
             }
             
-            async with session.post(api_url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        log.warning(f"   ⚠️ YouTube API {response.status}: {error_text[:100]}")
+                        continue
                     
-                    if result.get("status") == "ok":
-                        # Ищем ссылку на скачивание (360p или 480p)
-                        links = result.get("links", {}).get("mp4", {})
-                        
-                        for quality in ["360", "480", "720"]:
-                            if quality in links:
-                                video_url = links[quality].get("url")
-                                if video_url:
-                                    # Скачиваем
-                                    async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
-                                        if video_resp.status == 200:
-                                            video_data = await video_resp.read()
-                                            log.info(f"   ✅ Скачано через y2mate: {len(video_data) / 1024 / 1024:.1f} MB")
-                                            return video_data
-    except Exception as e:
-        log.debug(f"   y2mate failed: {e}")
-    
-    # Метод 2: ssyoutube (добавляем ss перед youtube.com)
-    try:
-        log.info("   Пробую ssyoutube...")
-        download_url = f"https://ssyoutube.com/watch?v={video_id}"
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(download_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
+                    data = await response.json()
+                    video_ids = [item["id"]["videoId"] for item in data.get("items", []) 
+                                if item["id"].get("kind") == "youtube#video"]
                     
-                    # Ищем прямую ссылку в HTML
-                    import re
-                    match = re.search(r'"url":"(https://[^"]+\.mp4[^"]*)"', html)
-                    if match:
-                        video_url = match.group(1).replace("\\u0026", "&")
+                    if not video_ids:
+                        log.info(f"   Ничего не найдено")
+                        continue
+                    
+                    log.info(f"   Найдено {len(video_ids)} кандидатов, фильтрую...")
+                    
+                    # Получаем детали видео
+                    details_url = "https://www.googleapis.com/youtube/v3/videos"
+                    details_params = {
+                        "part": "snippet,statistics,contentDetails",
+                        "id": ",".join(video_ids[:50]),
+                        "key": YOUTUBE_API_KEY
+                    }
+                    
+                    async with session.get(details_url, params=details_params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            continue
                         
-                        async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
-                            if video_resp.status == 200:
-                                video_data = await video_resp.read()
-                                log.info(f"   ✅ Скачано через ssyoutube: {len(video_data) / 1024 / 1024:.1f} MB")
-                                return video_data
-    except Exception as e:
-        log.debug(f"   ssyoutube failed: {e}")
-    
-    # Метод 3: Прямой запрос к YouTube (работает для некоторых видео)
-    try:
-        log.info("   Пробую прямой запрос...")
-        async with aiohttp.ClientSession() as session:
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
+                        details_data = await resp.json()
+                        
+                        for item in details_data.get("items", []):
+                            try:
+                                duration = item["contentDetails"]["duration"]
+                                total_sec = parse_duration_to_seconds(duration)
+                                
+                                # ФИЛЬТР 1: 10-60 секунд
+                                if not (10 <= total_sec <= 60):
+                                    continue
+                                
+                                snippet = item["snippet"]
+                                stats = item["statistics"]
+                                
+                                title = snippet.get("title", "")
+                                channel_title = snippet.get("channelTitle", "")
+                                description = snippet.get("description", "")
+                                
+                                # ФИЛЬТР 2: ТОЛЬКО РУССКИЙ (не украинский!)
+                                if not is_russian_content(title, channel_title, description):
+                                    continue
+                                
+                                # ФИЛЬТР 3: ТОЛЬКО новостные каналы
+                                if not is_trusted_news_channel(channel_title):
+                                    log.debug(f"   ⚠️ Не новостной канал: {channel_title}")
+                                    continue
+                                
+                                # ФИЛЬТР 4: НОВОСТНОЙ контент
+                                if not is_news_content(title, description):
+                                    log.debug(f"   ⚠️ Не новостной контент: {title[:40]}")
+                                    continue
+                                
+                                # ФИЛЬТР 5: Минимум просмотров
+                                views = int(stats.get("viewCount", 0))
+                                if views < 5000:
+                                    continue
+                                
+                                all_shorts.append({
+                                    "id": item["id"],
+                                    "title": title,
+                                    "channel": channel_title,
+                                    "channel_id": snippet["channelId"],
+                                    "views": views,
+                                    "likes": int(stats.get("likeCount", 0)),
+                                    "duration_sec": total_sec,
+                                    "published": snippet.get("publishedAt", ""),
+                                    "url": f"https://youtube.com/shorts/{item['id']}"
+                                })
+                                
+                            except Exception as e:
+                                log.debug(f"   Пропуск видео: {e}")
+                                continue
             
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "*/*"
-            }
+            await asyncio.sleep(0.3)
             
-            async with session.get(video_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    
-                    # Ищем streamingData
-                    import re
-                    match = re.search(r'"streamingData":\s*({.+?})\s*[,}]', html)
-                    if match:
-                        import json
-                        streaming_data = json.loads(match.group(1))
-                        
-                        # Берём адаптивный формат (видео+аудио)
-                        formats = streaming_data.get("formats", [])
-                        if formats:
-                            video_url = formats[0].get("url")
-                            
-                            if video_url:
-                                async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=60)) as video_resp:
-                                    if video_resp.status == 200:
-                                        video_data = await video_resp.read()
-                                        log.info(f"   ✅ Скачано напрямую: {len(video_data) / 1024 / 1024:.1f} MB")
-                                        return video_data
-    except Exception as e:
-        log.debug(f"   Прямой запрос failed: {e}")
+        except Exception as e:
+            log.warning(f"   Ошибка поиска '{query}': {e}")
+            continue
     
-    log.error("   ❌ Все методы скачивания провалились")
-    return None
+    # Убираем дубликаты по video_id
+    seen_ids = set()
+    unique_shorts = []
+    for short in all_shorts:
+        if short["id"] not in seen_ids:
+            seen_ids.add(short["id"])
+            unique_shorts.append(short)
+    
+    # Сортируем по просмотрам
+    unique_shorts.sort(key=lambda x: x["views"], reverse=True)
+    
+    log.info(f"✅ Найдено {len(unique_shorts)} РУССКИХ новостных Shorts")
+    return unique_shorts
 
-
-async def post_youtube_tops(force=False):
-    """Постит ОДИН пост: Shorts видео + инфа про full видео в подписи"""
-    log.info("🚀 Запуск задачи YouTube топов...")
+# ================== СКАЧИВАНИЕ ЧЕРЕЗ YT-DLP ==================
+async def download_shorts_video(video_id):
+    """Скачивает Shorts через yt-dlp с диагностикой"""
+    output_file = os.path.join(TEMP_DIR, f"shorts_{video_id}.mp4")
     
-    # Получаем trending full видео
-    trending = await get_trending_videos()
-    full_videos = [v for v in trending if not v["is_short"]]
-    full_videos.sort(key=lambda x: x["views"], reverse=True)
-    
-    # Получаем НАСТОЯЩИЕ Shorts
-    shorts_videos = await search_popular_shorts()
-    shorts_videos.sort(key=lambda x: x["views"], reverse=True)
-    
-    log.info(f"📊 Найдено: {len(full_videos)} полных видео, {len(shorts_videos)} Shorts")
-    
-    # Ищем неопубликованные
-    top_full = None
-    for v in full_videos:
-        if force or not is_youtube_posted_today(v["id"]):
-            top_full = v
-            break
-    
-    top_short = None
-    for v in shorts_videos:
-        if force or not is_youtube_posted_today(v["id"]):
-            top_short = v
-            break
-    
-    if not top_full or not top_short:
-        log.info(f"ℹ️ Не хватает видео: full={'✅' if top_full else '❌'}, shorts={'✅' if top_short else '❌'}")
-        
-        if force and (top_full or top_short):
-            log.info("🔄 Force режим: публикую что есть")
-            top_full = top_full or (full_videos[0] if full_videos else None)
-            top_short = top_short or (shorts_videos[0] if shorts_videos else None)
-        
-        if not top_full or not top_short:
-            return
-    
-    # ГЛАВНЫЙ ПОСТ: Shorts видео + инфа про full в caption
     try:
-        log.info(f"📥 Скачиваю Shorts: {top_short['title'][:50]}...")
-        log.info(f"   URL: {top_short['url']}")
+        log.info("   📥 Скачиваю через yt-dlp...")
         
-        # Скачиваем Shorts
-        video_data = await download_youtube_video(top_short['id'])
+        # Используем обычный URL вместо /shorts/ (работает стабильнее)
+        url = f"https://www.youtube.com/watch?v={video_id}"
         
-        if not video_data:
-            log.error("❌ Не удалось скачать Shorts, отправляю ссылками")
-            raise Exception("Download failed")
+        # ВАЖНО: Используем Python модуль вместо прямого вызова
+        # Работает на Windows даже если yt-dlp не в PATH
+        cmd = [
+            sys.executable,  # Путь к текущему Python
+            "-m", "yt_dlp",  # Запуск как модуль
+            "-f", "bv*+ba/b",  # Универсальный формат для Shorts (видео+аудио или лучший)
+            "-o", output_file,
+            "--no-playlist",
+            "--merge-output-format", "mp4",  # Конвертируем в MP4
+            "--extractor-args", "youtube:player_client=android",  # Используем Android клиент (обходит ограничения)
+            "--no-check-certificate",  # Игнорируем SSL ошибки
+            "--socket-timeout", "30",  # Таймаут соединения
+            url
+        ]
         
-        # Формируем подпись
-        caption = (
-            f"🎬 **Топ YouTube РФ сегодня**\n\n"
-            f"⚡ **Самый популярный Shorts:**\n"
-            f"{top_short['title']}\n"
-            f"📺 {top_short['channel']}\n"
-            f"👀 {format_views(top_short['views'])} | ❤️ {format_views(top_short['likes'])}\n\n"
-            f"🔥 **Самое популярное видео:**\n"
-            f"{top_full['title']}\n"
-            f"📺 {top_full['channel']}\n"
-            f"👀 {format_views(top_full['views'])} | ❤️ {format_views(top_full['likes'])}\n"
-            f"🔗 {top_full['url']}"
+        log.info(f"   🔧 Скачиваю...")
+        
+        # Запускаем скачивание
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         
-        # Отправляем Shorts как видео
-        from aiogram.types import BufferedInputFile
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=90)
         
-        video_file = BufferedInputFile(video_data, filename=f"{top_short['id']}.mp4")
-        
-        await bot.send_video(
-            CHANNEL_ID,
-            video=video_file,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-            supports_streaming=True
-        )
-        
-        save_youtube_posted(top_full['id'], 'full')
-        save_youtube_posted(top_short['id'], 'shorts')
-        log.info("✅ Комбо-пост опубликован")
-        
+        if process.returncode == 0 and os.path.exists(output_file):
+            file_size = os.path.getsize(output_file) / 1024 / 1024
+            log.info(f"   ✅ Скачано {file_size:.1f} MB")
+            return output_file
+        else:
+            error_msg = stderr.decode()[:300] if stderr else stdout.decode()[:300]
+            log.error(f"   ❌ yt-dlp ошибка: {error_msg}")
+            
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            
+            return None
+            
+    except asyncio.TimeoutError:
+        log.error("   ❌ Таймаут скачивания (>90 сек)")
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        return None
     except Exception as e:
-        log.error(f"❌ Ошибка комбо-поста: {e}")
-        log.info("📤 Отправляю ссылками...")
+        log.error(f"   ❌ Ошибка скачивания: {e}")
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        return None
+
+# ================== ПОСТИНГ С АВТОУДАЛЕНИЕМ ==================
+async def post_top_news_short(force=False):
+    """Постит ТОП новостной Shorts → удаляет файл"""
+    log.info("🚀 Запуск: Топ новостной Shorts (ТОЛЬКО РУ)...")
+    
+    # Ищем Shorts
+    shorts = await search_news_shorts()
+    
+    if not shorts:
+        log.warning("⚠️ Русские новостные Shorts не найдены")
+        return False
+    
+    # Пробуем скачать и запостить топ-5
+    for i, short_video in enumerate(shorts[:5], 1):
+        # Проверяем что не постили сегодня
+        if not force and is_youtube_posted_today(short_video["id"]):
+            log.info(f"   [{i}/5] Пропуск (уже постили): {short_video['title'][:50]}")
+            continue
         
-        # FALLBACK: Оба как ссылки
+        log.info(f"🎯 [{i}/5] Пробую: {short_video['title'][:60]}...")
+        log.info(f"   👀 {format_views(short_video['views'])} | 📺 {short_video['channel']}")
+        
+        # Скачиваем
+        video_file_path = await download_shorts_video(short_video['id'])
+        
+        if not video_file_path:
+            log.warning(f"   ⚠️ Не удалось скачать, пробую следующий...")
+            continue
+        
+        # Отправляем в Telegram
         try:
             caption = (
-                f"🎬 **Топ YouTube РФ сегодня**\n\n"
-                f"⚡ **Самый популярный Shorts:**\n"
-                f"{top_short['title']}\n"
-                f"📺 {top_short['channel']}\n"
-                f"👀 {format_views(top_short['views'])} | ❤️ {format_views(top_short['likes'])}\n"
-                f"🔗 {top_short['url']}\n\n"
-                f"🔥 **Самое популярное видео:**\n"
-                f"{top_full['title']}\n"
-                f"📺 {top_full['channel']}\n"
-                f"👀 {format_views(top_full['views'])} | ❤️ {format_views(top_full['likes'])}\n"
-                f"🔗 {top_full['url']}"
+                f"⚡ **Главный новостной Shorts дня**\n\n"
+                f"**{short_video['title']}**\n\n"
+                f"📺 {short_video['channel']}\n"
+                f"👀 {format_views(short_video['views'])} просмотров | "
+                f"❤️ {format_views(short_video['likes'])}"
             )
             
-            await bot.send_message(
+            # Читаем файл
+            with open(video_file_path, 'rb') as f:
+                video_data = f.read()
+            
+            video_file = BufferedInputFile(video_data, filename=f"{short_video['id']}.mp4")
+            
+            await bot.send_video(
                 CHANNEL_ID,
-                caption,
+                video=video_file,
+                caption=caption,
                 parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=False
+                supports_streaming=True,
+                width=1080,
+                height=1920
             )
             
-            save_youtube_posted(top_full['id'], 'full')
-            save_youtube_posted(top_short['id'], 'shorts')
-            log.info("✅ Пост со ссылками опубликован")
+            save_youtube_posted(short_video['id'], 'shorts')
+            log.info("✅ Опубликовано!")
             
-        except Exception as e2:
-            log.error(f"❌ Ошибка fallback: {e2}")
+            # Удаляем файл после отправки
+            os.remove(video_file_path)
+            log.info(f"🗑️ Файл удалён: {video_file_path}")
+            
+            return True
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка отправки: {e}")
+            
+            if os.path.exists(video_file_path):
+                os.remove(video_file_path)
+                log.info(f"🗑️ Файл удалён после ошибки")
+            
+            continue
+    
+    log.warning("⚠️ Не удалось запостить ни один Shorts из топ-5")
+    return False
 
+# ================== ОЧИСТКА СТАРЫХ ФАЙЛОВ ==================
+def cleanup_old_files():
+    """Удаляет старые файлы из папки temp (>1 день)"""
+    try:
+        now = datetime.now().timestamp()
+        for filename in os.listdir(TEMP_DIR):
+            filepath = os.path.join(TEMP_DIR, filename)
+            
+            if os.path.isfile(filepath):
+                file_age = now - os.path.getmtime(filepath)
+                
+                if file_age > 86400:
+                    os.remove(filepath)
+                    log.info(f"🗑️ Удалён старый файл: {filename}")
+    except Exception as e:
+        log.warning(f"⚠️ Ошибка очистки: {e}")
 
+# ================== ТЕСТ ==================
 async def main():
     """Тестовый запуск"""
     log.info("=" * 60)
-    log.info("🧪 ТЕСТ YouTube Data API v3 (только РУ контент)")
+    log.info("🧪 ТЕСТ: Русские новостные Shorts")
+    log.info(f"📁 Папка скачивания: {TEMP_DIR}")
     log.info("=" * 60)
     
-    if YOUTUBE_API_KEY == 'ВАША_API_KEY':
-        log.error("❌ Укажите YOUTUBE_API_KEY!")
-        return
+    # Очищаем старые файлы
+    cleanup_old_files()
     
-    trending = await get_trending_videos()
-    shorts = await search_popular_shorts()
+    shorts = await search_news_shorts()
     
-    if trending or shorts:
-        full_videos = [v for v in trending if not v.get("is_short")]
-        full_videos.sort(key=lambda x: x["views"], reverse=True)
+    if shorts:
+        log.info(f"\n⚡ ТОП-10 РУССКИХ НОВОСТНЫХ SHORTS:")
+        for i, s in enumerate(shorts[:10], 1):
+            posted = "✅" if is_youtube_posted_today(s["id"]) else "🆕"
+            log.info(f"{i}. {posted} {s['title'][:70]}")
+            log.info(f"   👀 {format_views(s['views'])} | 📺 {s['channel']}")
+            log.info(f"   ⏱️ {s['duration_sec']}с | 🔗 {s['url']}")
+            log.info("")
         
-        shorts.sort(key=lambda x: x["views"], reverse=True)
-        
-        log.info(f"\n🎬 ТОП-5 ПОЛНЫХ ВИДЕО (РУ):")
-        for i, v in enumerate(full_videos[:5], 1):
-            posted = "✅" if is_youtube_posted_today(v["id"]) else "🆕"
-            log.info(f"{i}. {posted} {v['title'][:60]}...")
-            log.info(f"   👀 {format_views(v['views'])} | 📺 {v['channel']}")
-        
-        log.info(f"\n⚡ ТОП-5 SHORTS (РУ):")
-        for i, v in enumerate(shorts[:5], 1):
-            posted = "✅" if is_youtube_posted_today(v["id"]) else "🆕"
-            log.info(f"{i}. {posted} {v['title'][:60]}...")
-            log.info(f"   👀 {format_views(v['views'])} | 📺 {v['channel']}")
-            log.info(f"   🔗 {v['url']}")
-        
-        print("\n" + "=" * 60)
+        print("=" * 60)
         print("Опции:")
-        print("1. Отправить топы (только новые)")
-        print("2. Отправить топы (force - игнорировать дубликаты)")
+        print("1. Скачать и отправить топ Shorts (только новый)")
+        print("2. Скачать и отправить топ Shorts (force)")
         print("3. Очистить базу за сегодня")
+        print("4. Очистить папку temp")
+        print("5. Проверить установку yt-dlp")
         print("0. Выход")
         choice = input("Выбери: ").strip()
         
         if choice == '1':
-            await post_youtube_tops(force=False)
+            await post_top_news_short(force=False)
         elif choice == '2':
-            await post_youtube_tops(force=True)
+            await post_top_news_short(force=True)
         elif choice == '3':
             today = datetime.now().date().isoformat()
             c.execute("DELETE FROM youtube_posted WHERE DATE(posted_at) = ?", (today,))
             conn.commit()
             log.info(f"✅ Очищена база за {today}")
+        elif choice == '4':
+            for filename in os.listdir(TEMP_DIR):
+                filepath = os.path.join(TEMP_DIR, filename)
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+            log.info(f"✅ Папка {TEMP_DIR} очищена")
+        elif choice == '5':
+            # Проверка yt-dlp через Python модуль
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "yt_dlp", "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                if process.returncode == 0:
+                    print(f"✅ yt-dlp установлен: {stdout.decode().strip()}")
+                    print(f"✅ Python путь: {sys.executable}")
+                else:
+                    print(f"❌ Ошибка: {stderr.decode()}")
+            except Exception as e:
+                print(f"❌ yt-dlp НЕ НАЙДЕН: {e}")
+                print(f"💡 Установи: {sys.executable} -m pip install yt-dlp")
         else:
             log.info("👋 Выход")
+    else:
+        log.warning("⚠️ Не найдено ни одного русского новостного Shorts")
     
     await bot.session.close()
     conn.close()
 
-
 if __name__ == "__main__":
-    from datetime import timedelta
     asyncio.run(main())
