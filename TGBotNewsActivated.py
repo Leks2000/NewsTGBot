@@ -22,9 +22,9 @@ load_dotenv()
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
 CHANNEL_ID = '@bulmyash'
 TIMEZONE = "Europe/Moscow"
@@ -71,13 +71,29 @@ KEYWORDS = [
 BORING_KEYWORDS = [
     'погода', 'синоптик', 'температур', 'осадк', 'прогноз погоды',
     'гороскоп', 'лунный', 'сонник', 'приметы', 'именины',
+    'стажировк', 'обеспечить', 'поручил',
 ]
 
+# РАСШИРЕННЫЙ СПИСОК НОВОСТНЫХ КАНАЛОВ
 RU_NEWS_CHANNELS = [
+    # Официальные СМИ
     "РИА Новости", "ТАСС", "Известия", "Интерфакс", "РБК",
     "Коммерсантъ", "Ведомости", "Первый канал", "Россия 24",
-    "НТВ", "RT", "ДЕНЬ ТВ", "Кремль", "Дождь", "Медуза",
-    "вДудь", "Популярная политика", "ФЕЙГИН LIVE", "Время Прядко",
+    "НТВ", "RT", "ДЕНЬ ТВ", "Кремль", 
+    # Независимые
+    "Дождь", "Медуза", "Новая газета",
+    # Блогеры/авторы
+    "вДудь", "Популярная политика", "ФЕЙГИН LIVE", 
+    "Время Прядко", "Время Прядко Shorts",
+    # Новые каналы для разнообразия
+    "Редакция", "Навальный LIVE", "Varlamov", "Varlamov News",
+    "Soloviev LIVE", "Соловьёв LIVE", "60 минут",
+    "Царьград ТВ", "Спутник", "Life", "Лайф",
+    "Mash", "Shot", "112", "Baza", "База",
+    "Readovka", "WarGonzo", "Rybar", "Рыбарь",
+    "BRIEF", "Незыгарь", "Подъём", "Новости",
+    "Политика сегодня", "Россия 1", "ОТР",
+    "Эхо", "The Insider", "Важные истории",
 ]
 
 # ================== БАЗА ДАННЫХ ==================
@@ -95,6 +111,11 @@ c.execute('''CREATE TABLE IF NOT EXISTS youtube_posted (
     video_id TEXT UNIQUE, 
     posted_at TEXT, 
     type TEXT
+)''')
+# НОВАЯ ТАБЛИЦА: отслеживание каналов YouTube
+c.execute('''CREATE TABLE IF NOT EXISTS youtube_channels_used (
+    channel_name TEXT,
+    used_at TEXT
 )''')
 c.execute('''CREATE TABLE IF NOT EXISTS daily_stats (
     date TEXT UNIQUE, 
@@ -132,18 +153,14 @@ def save_posted(title, url):
     conn.commit()
 
 def track_used_image(url: str):
-    """Сохраняет использованную картинку в БД"""
     c.execute("INSERT INTO used_images (url, used_at) VALUES (?, ?)", 
               (url, datetime.now().isoformat()))
     conn.commit()
-    
-    # Очищаем старые (>7 дней)
     week_ago = (datetime.now() - timedelta(days=7)).isoformat()
     c.execute("DELETE FROM used_images WHERE used_at < ?", (week_ago,))
     conn.commit()
 
 def get_recent_images() -> list:
-    """Получает картинки использованные за последние 24 часа"""
     yesterday = (datetime.now() - timedelta(hours=24)).isoformat()
     c.execute("SELECT url FROM used_images WHERE used_at > ?", (yesterday,))
     return [row[0] for row in c.fetchall()]
@@ -159,184 +176,196 @@ def save_youtube_posted(video_id, video_type):
               (video_id, datetime.now().isoformat(), video_type))
     conn.commit()
 
+# НОВЫЕ ФУНКЦИИ: отслеживание каналов
+def track_youtube_channel(channel_name: str):
+    """Запоминаем использованный канал"""
+    c.execute("INSERT INTO youtube_channels_used (channel_name, used_at) VALUES (?, ?)", 
+              (channel_name.lower(), datetime.now().isoformat()))
+    conn.commit()
+    # Чистим старые записи (старше 3 дней)
+    three_days_ago = (datetime.now() - timedelta(days=3)).isoformat()
+    c.execute("DELETE FROM youtube_channels_used WHERE used_at < ?", (three_days_ago,))
+    conn.commit()
+
+def get_recent_channels(hours: int = 12) -> list:
+    """Получаем недавно использованные каналы"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    c.execute("SELECT DISTINCT channel_name FROM youtube_channels_used WHERE used_at > ?", (cutoff,))
+    return [row[0] for row in c.fetchall()]
+
+def get_channel_usage_count(channel_name: str, hours: int = 24) -> int:
+    """Сколько раз использовали канал за последние N часов"""
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    c.execute("SELECT COUNT(*) FROM youtube_channels_used WHERE channel_name = ? AND used_at > ?", 
+              (channel_name.lower(), cutoff))
+    result = c.fetchone()
+    return result[0] if result else 0
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger("news_bot")
 bot = Bot(BOT_TOKEN)
 
+# ================== AI HELPER ==================
+async def ask_ai(prompt: str, temperature=0.7) -> str:
+    """Универсальная функция для AI запросов"""
+    if not OPENROUTER_API_KEY:
+        return None
+    
+    models = [
+        "nousresearch/hermes-3-llama-3.1-405b:free",
+        "meta-llama/llama-3.1-8b-instruct:free",
+        "google/gemma-2-9b-it:free",
+    ]
+    
+    for model in models:
+        try:
+            async with aiohttp.ClientSession() as s:
+                headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "max_tokens": 800
+                }
+                async with s.post("https://openrouter.ai/api/v1/chat/completions",
+                                 headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.debug(f"AI error ({model}): {e}")
+            continue
+    
+    return None
+
 # ================== AI: ВЫБОР НОВОСТИ ==================
 async def ai_select_and_summarize(news_list: list) -> dict:
-    """AI выбирает новость и делает ЯЗВИТЕЛЬНЫЙ/КОМИЧНЫЙ пересказ"""
-    
+    """AI выбирает новость и делает пересказ с КОРОТКИМИ хештегами"""
     news_text = "\n".join([f"{i+1}. {n['title']}" for i, n in enumerate(news_list[:25])])
     
-    prompt = f"""Ты редактор ДЕРЗКОГО новостного Telegram-канала в стиле "Медузы" или "Пивного журналиста".
+    prompt = f"""Ты редактор ДЕРЗКОГО новостного Telegram-канала.
 
-Выбери ОДНУ самую взрывную новость и сделай язвительный/ироничный пересказ.
+Выбери ОДНУ самую взрывную новость и сделай язвительный пересказ.
 
 ВАЖНО:
-1. Заголовок должен быть ОРИГИНАЛЬНЫМ (не копируй исходный)
-2. Пересказ должен ДОПОЛНЯТЬ заголовок новыми фактами/контекстом
-3. Тон: ироничный, язвительный, но без мата
-4. Пересказ 2-3 предложения, НО без повторения инфы из заголовка
+1. Выбирай ГОРЯЧИЕ новости (конфликты, деньги, взрывы, скандалы)
+2. Заголовок КОРОТКИЙ (макс 60 символов)
+3. Убери "как", "почему", лишние слова
+4. Пересказ ДОПОЛНЯЕТ заголовок
+5. НЕ ВЫБИРАЙ философские цитаты и скучную хуйню!
 
-Примеры правильного стиля:
+ХЕШТЕГИ - КРИТИЧЕСКИ ВАЖНО:
+- ТОЛЬКО односложные слова!
+- КАЖДЫЙ хештег ОТДЕЛЬНО через пробел
+- Максимум 4 хештега
+- БЕЗ склейки слов!
 
-Исходная новость: "Путин подписал указ о повышении МРОТ"
-❌ ПЛОХО:
-Заголовок: Путин подписал указ о повышении МРОТ
-Пересказ: Президент России Владимир Путин подписал указ о повышении минимального размера оплаты труда.
+Примеры ПРАВИЛЬНЫХ хештегов:
+✅ #Путин #Москва #Переговоры #Дипломатия
+✅ #Трамп #США #Санкции #Экономика
+✅ #Доллар #Курс #Рубль #Биржа
+✅ #Миграция #США #Тюрьма #Журналистика
 
-✅ ХОРОШО:
-Заголовок: МРОТ подрос на 300 рублей
-Пересказ: Кремль решил порадовать работающих бедняков прибавкой, которой хватит ровно на два похода в Макдоналдс. Экономисты уже подсчитали, что это покроет ровно треть инфляции.
-
-Исходная: "Трамп объявил о пошлинах из-за Гренландии"
-❌ ПЛОХО:
-Заголовок: Трамп вводит пошлины
-Пересказ: Дональд Трамп объявил о введении пошлин из-за ситуации с Гренландией.
-
-✅ ХОРОШО:
-Заголовок: Дания отказалась продавать Гренландию – Трамп включил экономические санкции
-Пересказ: Президент США решил надавить на "жадных датчан" через кошелёк. Пошлины коснутся всех стран Европы, которые "мешают сделке века". Дания пока молчит, но её экспорт уже плачет.
+Примеры НЕПРАВИЛЬНЫХ хештегов:
+❌ #войнавУкраине (склейка!)
+❌ #УиткоффКушнерПутин (склейка!)
+❌ #ЗеленскийТрамп (склейка!)
+❌ #ПереговорыВМоскве (склейка!)
 
 Верни JSON:
 {{
   "selected": номер (1-{len(news_list[:25])}),
-  "title": "ПЕРЕПИСАННЫЙ заголовок (короткий, цепляющий)",
-  "summary": "Пересказ с НОВЫМИ фактами/контекстом (без повтора заголовка)",
-  "hashtags": "2-4 хештега через пробел"
+  "title": "КОРОТКИЙ заголовок (макс 60 символов)",
+  "summary": "Пересказ 2-3 предложения",
+  "hashtags": "#Слово1 #Слово2 #Слово3 #Слово4"
 }}
-
-КРИТИЧНО:
-- Заголовок НЕ должен повторять исходный
-- Пересказ НЕ должен повторять заголовок
-- Максимум информативности + ирония
 
 Новости:
 {news_text}"""
     
-    # ВСЕ КЛЮЧИ ЧЕРЕЗ OPENROUTER
-    api_keys = [
-        ("OpenRouter-1", GROQ_API_KEY),
-        ("OpenRouter-2", OPENROUTER_API_KEY),
-        ("OpenRouter-3", os.getenv("OPENROUTER_API_KEY_2"))
-    ]
+    response = await ask_ai(prompt, temperature=0.9)
     
-    # РАБОЧИЕ БЕСПЛАТНЫЕ МОДЕЛИ (проверено 2026)
-    models = [
-        "nousresearch/hermes-3-llama-3.1-405b:free",
-        "meta-llama/llama-3.1-8b-instruct:free",
-        "google/gemini-flash-1.5-8b:free",
-        "qwen/qwen-2-7b-instruct:free",
-    ]
-    
-    for key_name, api_key in api_keys:
-        if not api_key:
-            continue
+    if response:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}')
+            if json_start != -1 and json_end != -1:
+                content = response[json_start:json_end+1]
+            else:
+                content = response
             
-        for model in models:
-            try:
-                log.info(f"   🤖 Пробую {key_name} → {model}...")
+            result = json.loads(content)
+            selected_idx = int(result.get("selected", 1)) - 1
+            
+            if 0 <= selected_idx < len(news_list):
+                selected_news = news_list[selected_idx]
+                selected_news["ai_title"] = result.get("title", selected_news["title"])
+                selected_news["summary"] = result.get("summary", "")
                 
-                async with aiohttp.ClientSession() as s:
-                    headers = {
-                        "Authorization": f"Bearer {api_key}", 
-                        "Content-Type": "application/json"
-                    }
-                    payload = {
-                        "model": model, 
-                        "messages": [{"role": "user", "content": prompt}], 
-                        "temperature": 0.9, 
-                        "max_tokens": 500
-                    }
-                    
-                    async with s.post("https://openrouter.ai/api/v1/chat/completions",
-                                     headers=headers, json=payload, 
-                                     timeout=aiohttp.ClientTimeout(total=30)) as r:
-                        if r.status == 200:
-                            data = await r.json()
-                            content = data["choices"][0]["message"]["content"].strip()
-                            
-                            # Извлекаем JSON
-                            json_start = content.find('{')
-                            json_end = content.rfind('}')
-                            if json_start != -1 and json_end != -1:
-                                content = content[json_start:json_end+1]
-                            
-                            result = json.loads(content)
-                            selected_idx = int(result.get("selected", 1)) - 1
-                            
-                            if 0 <= selected_idx < len(news_list):
-                                selected_news = news_list[selected_idx]
-                                selected_news["ai_title"] = result.get("title", selected_news["title"])
-                                selected_news["summary"] = result.get("summary", "")
-                                selected_news["hashtags"] = result.get("hashtags", "")
-                                log.info(f"✅ {key_name}/{model} выбрал #{selected_idx+1}")
-                                log.info(f"   📝 Заголовок: {selected_news['ai_title'][:60]}")
-                                return selected_news
-                        else:
-                            error_text = await r.text()
-                            log.warning(f"⚠️ {key_name}/{model} HTTP {r.status}: {error_text[:150]}")
-                            
-            except asyncio.TimeoutError:
-                log.warning(f"⚠️ {key_name}/{model} timeout")
-                continue
-            except Exception as e:
-                log.warning(f"⚠️ {key_name}/{model} error: {e}")
-                continue
+                # Валидация хештегов - разбиваем склеенные
+                raw_hashtags = result.get("hashtags", "")
+                selected_news["hashtags"] = fix_hashtags(raw_hashtags)
+                
+                log.info(f"✅ AI выбрал #{selected_idx+1}: {selected_news['ai_title'][:50]}")
+                return selected_news
+        except Exception as e:
+            log.warning(f"⚠️ AI parse error: {e}")
     
-    log.warning("⚠️ Все AI недоступны, делаю fallback с нормальным форматом")
-    
-    # Выбираем приоритетную новость
-    priority_keywords = ['трамп', 'путин', 'война', 'взрыв', 'доллар', 'санкц', 'арест']
-    scored = []
-    for news in news_list[:10]:
-        score = sum(1 for kw in priority_keywords if kw in news["title"].lower())
-        scored.append((score, news))
-    
+    # Fallback
+    log.warning("⚠️ AI недоступен, fallback")
+    priority_keywords = ['трамп', 'путин', 'война', 'взрыв', 'доллар']
+    scored = [(sum(1 for kw in priority_keywords if kw in n["title"].lower()), n) for n in news_list[:10]]
     scored.sort(key=lambda x: x[0], reverse=True)
     selected = scored[0][1] if scored else random.choice(news_list[:5])
     
-    # ДЕЛАЕМ НОРМАЛЬНЫЙ ПЕРЕСКАЗ БЕЗ ДУБЛЯЖА
-    original_title = selected["title"]
     desc = selected["desc"] if selected["desc"] else ""
+    sentences = [s for s in re.split(r'[.!?]\s+', desc) if len(s) > 30]
+    summary = '. '.join(sentences[:2]) + '.' if sentences else "Подробности выясняются."
     
-    # Извлекаем основные факты из описания
-    sentences = re.split(r'[.!?]\s+', desc)
-    
-    # Ищем предложения которых НЕТ в заголовке
-    unique_sentences = []
-    for sent in sentences:
-        if len(sent) > 30:  # Минимальная длина
-            # Проверяем что предложение не дублирует заголовок
-            words_in_title = set(original_title.lower().split())
-            words_in_sent = set(sent.lower().split())
-            overlap = len(words_in_title & words_in_sent) / max(len(words_in_sent), 1)
-            
-            if overlap < 0.5:  # Меньше 50% совпадения
-                unique_sentences.append(sent)
-    
-    # Берём первые 2 уникальных предложения
-    if unique_sentences:
-        summary = '. '.join(unique_sentences[:2]) + '.'
-    else:
-        # Если совсем нет описания - делаем краткий пересказ заголовка
-        summary = f"Подробности инцидента выясняются. Ситуация находится под контролем."
-    
-    # Обрезаем если слишком длинный
-    if len(summary) > 300:
-        summary = summary[:297] + '...'
-    
-    selected["ai_title"] = original_title  # Используем оригинальный заголовок
-    selected["summary"] = summary
-    selected["hashtags"] = generate_smart_hashtags(original_title, desc)
-    
-    log.info(f"   📝 Fallback выбрал: {original_title[:60]}")
-    log.info(f"   📝 Пересказ: {summary[:80]}...")
+    selected["ai_title"] = selected["title"]
+    selected["summary"] = summary[:300]
+    selected["hashtags"] = generate_smart_hashtags(selected["title"], desc)
     
     return selected
 
-# ================== СБОР НОВОСТЕЙ + ПАРСИНГ КАРТИНОК ==================
+# ================== ФИКС ХЕШТЕГОВ ==================
+def fix_hashtags(raw_hashtags: str) -> str:
+    """Разбивает склеенные хештеги на отдельные слова"""
+    
+    # Убираем @ упоминания
+    raw_hashtags = re.sub(r'@\w+', '', raw_hashtags).strip()
+    
+    # Находим все хештеги
+    tags = re.findall(r'#\w+', raw_hashtags)
+    
+    fixed_tags = []
+    for tag in tags:
+        word = tag[1:]  # убираем #
+        
+        # Проверяем, не склеено ли (ищем CamelCase или несколько заглавных)
+        parts = re.findall(r'[А-ЯЁA-Z][а-яёa-z]*|[а-яёa-z]+', word)
+        
+        if len(parts) > 1 and len(word) > 12:
+            # Склеенный хештег - берём только значимые части (длиннее 2 букв)
+            for part in parts:
+                if len(part) > 2:
+                    fixed_tags.append(f"#{part}")
+        else:
+            # Нормальный хештег
+            fixed_tags.append(tag)
+    
+    # Убираем дубликаты, оставляем максимум 4
+    seen = set()
+    unique_tags = []
+    for tag in fixed_tags:
+        tag_lower = tag.lower()
+        if tag_lower not in seen:
+            seen.add(tag_lower)
+            unique_tags.append(tag)
+    
+    return ' '.join(unique_tags[:4])
+
+# ================== СБОР НОВОСТЕЙ ==================
 async def collect_fresh_news(limit=30):
     candidates = []
     sources = list(RSS_SOURCES.items())
@@ -350,42 +379,29 @@ async def collect_fresh_news(limit=30):
             for entry in feed.entries[:5]:
                 if len(candidates) >= limit: break
                 
-                title = entry.title.strip()
+                title = BeautifulSoup(entry.title.strip(), "html.parser").get_text()
                 url = entry.link
-                desc = entry.get("summary", "") or entry.get("description", "") or ""
+                desc = BeautifulSoup(entry.get("summary", "") or entry.get("description", ""), "html.parser").get_text()
                 
-                title = BeautifulSoup(title, "html.parser").get_text()
-                desc = BeautifulSoup(desc, "html.parser").get_text()
-                
-                # ========== ПАРСИМ КАРТИНКУ ИЗ RSS ==========
+                # Парсим картинку
                 rss_image = None
-                
-                # 1. Пробуем media:content
                 if hasattr(entry, 'media_content') and entry.media_content:
                     rss_image = entry.media_content[0].get('url')
                 
-                # 2. Пробуем enclosure
                 if not rss_image and hasattr(entry, 'enclosures') and entry.enclosures:
                     for enc in entry.enclosures:
                         if enc.get('type', '').startswith('image/'):
                             rss_image = enc.get('href')
                             break
                 
-                # 3. Ищем <img> в description
                 if not rss_image:
                     soup = BeautifulSoup(entry.get("summary", "") or entry.get("description", ""), "html.parser")
                     img_tag = soup.find('img')
                     if img_tag and img_tag.get('src'):
                         rss_image = img_tag['src']
                 
-                # Проверяем валидность URL
-                if rss_image:
-                    if not rss_image.startswith('http'):
-                        rss_image = None
-                    # Проверяем что URL не обрезан (минимальная длина)
-                    elif len(rss_image) < 30:
-                        rss_image = None
-                        log.debug(f"   ⚠️ RSS картинка слишком короткая: {rss_image}")
+                if rss_image and (not rss_image.startswith('http') or len(rss_image) < 30):
+                    rss_image = None
                 
                 if len(title) < 20: continue
                 if is_duplicate(title, url): continue
@@ -393,11 +409,11 @@ async def collect_fresh_news(limit=30):
                 if not any(k in title.lower() for k in KEYWORDS): continue
                 
                 candidates.append({
-                    "title": title, 
-                    "url": url, 
-                    "desc": desc, 
+                    "title": title,
+                    "url": url,
+                    "desc": desc,
                     "source": source_name,
-                    "rss_image": rss_image  # СОХРАНЯЕМ КАРТИНКУ ИЗ RSS
+                    "rss_image": rss_image
                 })
                 
         except Exception as e:
@@ -405,211 +421,359 @@ async def collect_fresh_news(limit=30):
     
     return candidates
 
-# ================== УМНАЯ СИСТЕМА ПОИСКА КАРТИНОК ==================
+# ================== УЛУЧШЕННАЯ СИСТЕМА КАРТИНОК ==================
 
-def extract_keywords_for_image_search(title: str, description: str = "") -> list:
-    """Извлекает конкретные ключевые слова для поиска"""
+# ПЕРСОНЫ ДЛЯ ПОИСКА КОНКРЕТНЫХ ФОТ
+PERSON_SEARCH_QUERIES = {
+    'трамп': ['donald trump', 'trump president', 'trump speech'],
+    'путин': ['vladimir putin', 'putin russia', 'putin kremlin'],
+    'байден': ['joe biden', 'biden president', 'biden speech'],
+    'зеленск': ['zelensky ukraine', 'zelensky president'],
+    'макрон': ['macron france', 'macron president'],
+    'си цзиньпин': ['xi jinping', 'china president xi'],
+    'кушнер': ['jared kushner', 'kushner trump'],
+}
+
+async def ai_generate_image_queries(title: str, description: str) -> list:
+    """AI генерирует запросы, ВКЛЮЧАЯ КОНКРЕТНЫХ ЛЮДЕЙ если они в новости"""
+    
+    text_lower = f"{title} {description}".lower()
+    
+    # СНАЧАЛА проверяем персон в новости
+    person_queries = []
+    for person_key, queries in PERSON_SEARCH_QUERIES.items():
+        if person_key in text_lower:
+            # Добавляем запросы для этой персоны
+            person_queries.extend(queries[:2])
+            log.info(f"   🎯 Найдена персона: {person_key} → добавляю запросы: {queries[:2]}")
+    
+    # Если нашли персон - сразу их возвращаем (они приоритетнее)
+    if person_queries:
+        return person_queries[:3]
+    
+    # Иначе AI генерирует тематические запросы
+    prompt = f"""Новость: "{title}"
+
+Сгенерируй 3 поисковых запроса на АНГЛИЙСКОМ для поиска фото.
+
+ВАЖНО:
+- Если в новости есть ИЗВЕСТНЫЕ ЛЮДИ (политики, бизнесмены) - ИЩИ ИХ ФОТО!
+- Максимум 2-3 слова
+- На английском
+
+Примеры:
+"Путин встретился с Трампом" → ["putin trump", "kremlin meeting", "russia usa summit"]
+"Курс доллара вырос" → ["dollar currency", "stock market", "money exchange"]
+"Взрыв в жилом доме" → ["building explosion", "fire rescue", "emergency"]
+
+Верни JSON:
+{{"queries": ["запрос1", "запрос2", "запрос3"]}}"""
+    
+    response = await ask_ai(prompt, temperature=0.7)
+    
+    if response:
+        try:
+            json_start = response.find('{')
+            json_end = response.rfind('}')
+            if json_start != -1 and json_end != -1:
+                content = response[json_start:json_end+1]
+                result = json.loads(content)
+                queries = result.get("queries", [])[:3]
+                
+                # Ограничиваем 3 словами
+                cleaned = []
+                for q in queries:
+                    q = re.sub(r'\b(19|20)\d{2}\b', '', q).strip()
+                    words = q.split()
+                    if len(words) <= 3:
+                        cleaned.append(q)
+                    else:
+                        cleaned.append(' '.join(words[:3]))
+                
+                if cleaned:
+                    log.info(f"   ✅ AI сгенерировал запросы: {cleaned}")
+                    return cleaned
+        except Exception as e:
+            log.warning(f"   ⚠️ AI parse error: {e}")
+    
+    return generate_fallback_queries(title, description)
+
+
+def generate_fallback_queries(title: str, description: str) -> list:
+    """Генерирует запросы без AI на основе темы"""
     text = f"{title} {description}".lower()
     queries = []
     
-    # ГЕОГРАФИЯ - самое важное
-    places = {
-        'гренланд': ['greenland ice', 'greenland landscape', 'arctic greenland'],
-        'исланд': ['iceland volcano', 'iceland nature', 'reykjavik'],
-        'норвег': ['norway fjord', 'norway landscape'],
-        'швец': ['sweden stockholm', 'sweden flag'],
-        'дан': ['denmark copenhagen', 'denmark flag'],
-        'сыктывкар': ['russian city', 'komi republic russia'],
-        'москв': ['moscow kremlin', 'red square moscow'],
-        'петербург': ['saint petersburg', 'hermitage russia'],
-        'киев': ['kyiv ukraine', 'kiev city'],
-        'украин': ['ukraine flag', 'ukraine country'],
-        'вашингтон': ['washington dc', 'white house', 'capitol building'],
-        'нью-йорк': ['new york city', 'manhattan skyline'],
-        'лондон': ['london big ben', 'london eye'],
-        'париж': ['paris eiffel tower', 'paris france'],
-        'берлин': ['berlin brandenburg gate', 'berlin germany'],
-        'пекин': ['beijing forbidden city', 'beijing china'],
-        'токио': ['tokyo japan', 'tokyo tower'],
-    }
-    
-    for key, search_terms in places.items():
-        if key in text:
-            queries.extend(search_terms)
-            break
-    
-    # ПЕРСОНЫ
-    if 'трамп' in text: queries.append('donald trump president')
+    # ПЕРСОНЫ - приоритет!
+    if 'трамп' in text: queries.append('donald trump')
     if 'путин' in text: queries.append('vladimir putin')
     if 'байден' in text: queries.append('joe biden')
-    if 'зеленск' in text: queries.append('zelensky ukraine')
+    if 'зеленск' in text: queries.append('zelensky')
+    if 'макрон' in text: queries.append('macron')
     
-    # СОБЫТИЯ
-    if 'взрыв' in text: queries.extend(['explosion fire', 'emergency disaster'])
-    if 'пожар' in text: queries.extend(['fire building', 'firefighters'])
-    if 'доллар' in text or 'курс' in text: queries.extend(['us dollar bills', 'currency money'])
-    if 'война' in text: queries.extend(['military conflict', 'war soldiers'])
-    if 'нефть' in text: queries.append('oil refinery petroleum')
-    if 'газ' in text: queries.append('natural gas pipeline')
-    if 'космос' in text or 'ракет' in text: queries.extend(['rocket launch', 'space exploration'])
-    if 'ии' in text or 'искусственн' in text: queries.extend(['artificial intelligence', 'ai technology'])
+    # Если нашли персон - возвращаем
+    if queries:
+        return queries[:3]
     
+    # Политика и дипломатия
+    if any(w in text for w in ['перегов', 'встреч', 'визит', 'саммит']):
+        queries.append('diplomatic meeting')
+        queries.append('conference room')
+    
+    # Россия
+    if any(w in text for w in ['кремл', 'москв', 'росси']):
+        queries.append('kremlin moscow')
+        queries.append('russian government')
+    
+    # США
+    if any(w in text for w in ['сша', 'америк', 'вашингтон', 'белый дом']):
+        queries.append('white house washington')
+        queries.append('american flag')
+    
+    # Украина
+    if 'украин' in text or 'киев' in text:
+        queries.append('ukraine kyiv')
+    
+    # Война/конфликт
+    if any(w in text for w in ['война', 'конфликт', 'военн', 'армия']):
+        queries.append('military conflict')
+        queries.append('war zone')
+    
+    # Экономика
+    if any(w in text for w in ['доллар', 'рубль', 'курс', 'биржа', 'экономик']):
+        queries.append('stock market trading')
+        queries.append('dollar currency')
+    
+    # ЧП
+    if any(w in text for w in ['взрыв', 'пожар', 'авари']):
+        queries.append('explosion fire')
+        queries.append('emergency rescue')
+    
+    # Тюрьма/миграция
+    if any(w in text for w in ['тюрьм', 'мигр', 'депорт', 'задерж']):
+        queries.append('prison bars')
+        queries.append('detention center')
+    
+    # Давос
+    if 'давос' in text:
+        queries.append('davos forum')
+        queries.append('economic summit')
+    
+    # Дефолт
     if not queries:
-        queries.append('breaking news')
+        queries = ['world news', 'breaking news', 'global politics']
     
-    return queries[:4]  # Топ-4 запроса
+    log.info(f"   ⚠️ Fallback запросы: {queries[:3]}")
+    return queries[:3]
 
-async def search_unsplash_with_retries(query: str, retries=2) -> str:
-    """Ищет на Unsplash с повторными попытками"""
+async def search_unsplash(query: str, count=30) -> list:
+    """Ищет картинки на Unsplash"""
     if not UNSPLASH_ACCESS_KEY:
+        log.warning("   ❌ Unsplash API ключ не найден!")
+        return []
+    
+    try:
+        log.info(f"   🔍 Unsplash запрос: '{query}' (ищу {count} фото)")
+        
+        url = "https://api.unsplash.com/search/photos"
+        params = {"query": query, "per_page": count, "orientation": "landscape"}
+        headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+        
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                log.info(f"   📡 Unsplash ответ: HTTP {r.status}")
+                
+                if r.status == 200:
+                    data = await r.json()
+                    results = data.get("results", [])
+                    log.info(f"   ✅ Unsplash вернул {len(results)} фото")
+                    
+                    return [{"url": p["urls"]["regular"], "desc": p.get("description", "") or p.get("alt_description", ""), "source": "unsplash"} 
+                            for p in results[:count]]
+                elif r.status == 401:
+                    error_text = await r.text()
+                    log.error(f"   ❌ Unsplash 401 (неверный ключ): {error_text[:200]}")
+                elif r.status == 403:
+                    error_text = await r.text()
+                    log.error(f"   ❌ Unsplash 403 (лимит исчерпан): {error_text[:200]}")
+                else:
+                    error_text = await r.text()
+                    log.error(f"   ❌ Unsplash {r.status}: {error_text[:200]}")
+                    
+    except asyncio.TimeoutError:
+        log.error(f"   ⏱️ Unsplash timeout для '{query}'")
+    except Exception as e:
+        log.error(f"   ❌ Unsplash exception: {e}")
+    
+    return []
+
+async def search_pexels(query: str, count=30) -> list:
+    """Ищет картинки на Pexels"""
+    if not PEXELS_API_KEY:
+        log.warning("   ❌ Pexels API ключ не найден!")
+        return []
+    
+    try:
+        log.info(f"   🔍 Pexels запрос: '{query}' (ищу {count} фото)")
+        
+        url = "https://api.pexels.com/v1/search"
+        params = {"query": query, "per_page": count, "orientation": "landscape"}
+        headers = {"Authorization": PEXELS_API_KEY}
+        
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                log.info(f"   📡 Pexels ответ: HTTP {r.status}")
+                
+                if r.status == 200:
+                    data = await r.json()
+                    photos = data.get("photos", [])
+                    log.info(f"   ✅ Pexels вернул {len(photos)} фото")
+                    
+                    return [{"url": p["src"]["large"], "desc": p.get("alt", ""), "source": "pexels"} 
+                            for p in photos[:count]]
+                else:
+                    error_text = await r.text()
+                    log.error(f"   ❌ Pexels {r.status}: {error_text[:100]}")
+                    
+    except asyncio.TimeoutError:
+        log.error(f"   ⏱️ Pexels timeout для '{query}'")
+    except Exception as e:
+        log.error(f"   ❌ Pexels exception: {e}")
+    
+    return []
+
+async def ai_rate_images(images: list, title: str) -> dict:
+    """AI оценивает картинки по URL + ОПИСАНИЯМ"""
+    if not images:
         return None
     
-    for attempt in range(retries):
+    # ПОКАЗЫВАЕМ КАРТИНКИ С ОПИСАНИЯМИ
+    log.info(f"   📋 Найденные картинки ({len(images)} шт):")
+    for i, img in enumerate(images[:10], 1):
+        desc_preview = img.get('desc', 'нет описания')[:50]
+        log.info(f"      {i}. {img['source']}: {desc_preview}")
+    
+    images_text = "\n".join([
+        f"{i+1}. Описание: \"{img.get('desc', 'нет')}\" | Источник: {img['source']}" 
+        for i, img in enumerate(images[:30])
+    ])
+    
+    prompt = f"""Новость: "{title}"
+
+Вот {len(images[:30])} картинок с ОПИСАНИЯМИ:
+{images_text}
+
+Оцени каждую от 1 до 10 по релевантности к новости. ИСПОЛЬЗУЙ ОПИСАНИЯ для оценки!
+
+Верни JSON:
+{{
+  "best_id": номер лучшей (1-{len(images[:30])}),
+  "score": оценка (1-10),
+  "reason": "почему выбрал"
+}}
+
+Если ВСЕ картинки плохие (оценка < 5), верни {{"best_id": 0, "score": 0, "reason": "все плохие"}}"""
+    
+    response = await ask_ai(prompt, temperature=0.5)
+    
+    if response:
         try:
-            url = "https://api.unsplash.com/search/photos"
-            params = {
-                "query": query,
-                "per_page": 30,
-                "orientation": "landscape",
-                "order_by": "relevant",
-            }
-            headers = {
-                "Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}",
-                "Accept-Version": "v1"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers, 
-                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        results = data.get("results", [])
-                        
-                        if results and len(results) > 0:
-                            recent = get_recent_images()
-                            available = [
-                                photo["urls"]["regular"] 
-                                for photo in results[:20]
-                                if photo["urls"]["regular"] not in recent
-                            ]
-                            
-                            if available:
-                                selected = random.choice(available)
-                                log.info(f"   ✅ Unsplash нашёл по '{query}': {len(available)} вариантов")
-                                return selected
-                    elif r.status == 403:
-                        log.error(f"   ❌ Unsplash API лимит исчерпан")
-                        return None
-                    elif r.status == 401:
-                        log.error(f"   ❌ Unsplash API ключ неверный")
-                        return None
-                        
-        except asyncio.TimeoutError:
-            log.warning(f"   ⏱️ Unsplash timeout (попытка {attempt+1}/{retries})")
-            if attempt < retries - 1:
-                await asyncio.sleep(1)
+            json_start = response.find('{')
+            json_end = response.rfind('}')
+            if json_start != -1 and json_end != -1:
+                content = response[json_start:json_end+1]
+                result = json.loads(content)
+                best_id = int(result.get("best_id", 0))
+                score = int(result.get("score", 0))
+                reason = result.get("reason", "")
+                
+                log.info(f"   🤖 AI выбрал картинку #{best_id}, оценка {score}/10")
+                log.info(f"   💭 Причина: {reason}")
+                
+                if best_id > 0 and score >= 5 and best_id <= len(images):
+                    return {"image": images[best_id - 1], "score": score}
         except Exception as e:
-            log.debug(f"   ⚠️ Unsplash '{query}' error: {e}")
-            if attempt < retries - 1:
-                await asyncio.sleep(1)
+            log.warning(f"   ⚠️ AI parse error: {e}")
+    
+    # Fallback - берём первую
+    if images:
+        log.warning("   ⚠️ AI не смог выбрать, беру первую")
+        return {"image": images[0], "score": 5}
     
     return None
 
-async def get_perfect_image(title: str, description: str = "", rss_image: str = None) -> str:
+async def get_perfect_image(title: str, description: str, rss_image: str = None) -> str:
     """
-    ПРИОРИТЕТЫ ПОИСКА КАРТИНКИ:
-    1. Картинка из RSS (если есть и валидна)
-    2. Fallback пул (Unsplash отключён, нет ключа)
+    УЛУЧШЕННАЯ СИСТЕМА с НЕСКОЛЬКИМИ запросами:
+    1. AI генерирует запросы (включая персон)
+    2. Делаем ДО 5 запросов к Unsplash (разные запросы)
+    3. AI выбирает лучшее
     """
     
-    # ПРИОРИТЕТ 1: Картинка из RSS
-    if rss_image and len(rss_image) > 50:
-        log.info(f"   🎯 Проверяю RSS картинку: {rss_image[:80]}...")
+    log.info("   🎨 Запускаю УЛУЧШЕННЫЙ поиск картинок...")
+    
+    all_images = []
+    
+    # Шаг 1: AI генерирует запросы
+    queries = await ai_generate_image_queries(title, description)
+    
+    # Шаг 2: Делаем НЕСКОЛЬКО запросов к Unsplash (до 5)
+    for i, query in enumerate(queries[:3]):
+        log.info(f"   🔍 Запрос {i+1}/3: '{query}'")
         
+        unsplash_images = await search_unsplash(query, count=15)
+        if unsplash_images:
+            all_images.extend(unsplash_images)
+            log.info(f"   ✅ +{len(unsplash_images)} фото от Unsplash")
+        
+        # Небольшая пауза между запросами
+        await asyncio.sleep(0.3)
+    
+    # Шаг 3: Pexels как дополнение
+    if queries:
+        pexels_images = await search_pexels(queries[0], count=15)
+        if pexels_images:
+            all_images.extend(pexels_images)
+            log.info(f"   ✅ +{len(pexels_images)} фото от Pexels")
+    
+    # Шаг 4: RSS картинка
+    if rss_image and len(rss_image) > 50:
+        log.info(f"   🎯 Добавляю RSS картинку...")
         img_data = await download_image(rss_image)
         if img_data and len(img_data) > 5000:
-            recent = get_recent_images()
-            if rss_image not in recent:
-                track_used_image(rss_image)
-                log.info(f"   ✅ RSS картинка ОК ({len(img_data)//1024}KB)")
-                return rss_image
-            else:
-                log.info(f"   ⚠️ RSS картинка уже использовалась")
-        else:
-            log.warning(f"   ❌ RSS картинка битая")
+            all_images.append({"url": rss_image, "desc": "RSS original image", "source": "rss"})
     
-    # ПРИОРИТЕТ 2: Fallback (Unsplash отключён)
-    log.info("   📦 Используем fallback пул")
-    return get_fallback_image(f"{title} {description}".lower())
-
-def get_fallback_image(text: str) -> str:
-    """Огромный пул тематических картинок"""
+    # Шаг 5: Убираем дубликаты
+    seen_urls = set()
+    unique_images = []
+    for img in all_images:
+        if img["url"] not in seen_urls:
+            seen_urls.add(img["url"])
+            unique_images.append(img)
     
-    pools = {
-        'greenland': [
-            "https://images.unsplash.com/photo-1531366936337-7c912a4589a7",
-            "https://images.unsplash.com/photo-1583422409516-2895a77efded",
-            "https://images.unsplash.com/photo-1528127269322-539801943592",
-        ],
-        'usa': [
-            "https://images.unsplash.com/photo-1529107386315-e1a2ed48e620",
-            "https://images.unsplash.com/photo-1485081669829-bacb8c7bb1f3",
-            "https://images.unsplash.com/photo-1563306406-e66174fa3787",
-            "https://images.unsplash.com/photo-1509024644558-2f56ce76c490",
-            "https://images.unsplash.com/photo-1566073771259-6a8506099945",
-        ],
-        'russia': [
-            "https://images.unsplash.com/photo-1513326738677-b964603b136d",
-            "https://images.unsplash.com/photo-1520106212299-d99c443e4568",
-            "https://images.unsplash.com/photo-1547448415-e9f5b28e570d",
-            "https://images.unsplash.com/photo-1523906834658-6e24ef2386f9",
-        ],
-        'ukraine': [
-            "https://images.unsplash.com/photo-1562077772-3bd90403f7f0",
-            "https://images.unsplash.com/photo-1599930113854-d6d7fd521f10",
-        ],
-        'war': [
-            "https://images.unsplash.com/photo-1526374965328-7f61d4dc18c5",
-            "https://images.unsplash.com/photo-1580982172477-9373ff52ae43",
-            "https://images.unsplash.com/photo-1562007908-17c67e878c88",
-        ],
-        'finance': [
-            "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3",
-            "https://images.unsplash.com/photo-1460925895917-afdab827c52f",
-            "https://images.unsplash.com/photo-1579621970563-ebec7560ff3e",
-        ],
-        'general': [
-            "https://images.unsplash.com/photo-1504711434969-e33886168f5c",
-            "https://images.unsplash.com/photo-1495020689067-958852a7765e",
-            "https://images.unsplash.com/photo-1586339949916-3e9457bef6d3",
-        ]
-    }
+    log.info(f"   📊 Всего уникальных картинок: {len(unique_images)}")
     
-    # Выбор пула
-    if 'гренланд' in text:
-        pool = pools['greenland']
-    elif any(w in text for w in ['трамп', 'сша', 'америк']):
-        pool = pools['usa']
-    elif any(w in text for w in ['путин', 'россия', 'кремл']):
-        pool = pools['russia']
-    elif 'украин' in text:
-        pool = pools['ukraine']
-    elif 'война' in text:
-        pool = pools['war']
-    elif any(w in text for w in ['доллар', 'рубль', 'курс']):
-        pool = pools['finance']
-    else:
-        pool = pools['general']
+    if not unique_images:
+        log.error("   ❌ НЕ НАЙДЕНО КАРТИНОК!")
+        return None
     
-    recent = get_recent_images()
-    available = [img for img in pool if img not in recent]
+    # Шаг 6: AI выбирает лучшую
+    best = await ai_rate_images(unique_images, title)
     
-    if not available:
-        available = pool
+    if best and best["score"] >= 5:
+        img_url = best["image"]["url"]
+        log.info(f"   🏆 ПОБЕДИТЕЛЬ: {best['image']['source']} (оценка {best['score']}/10)")
+        track_used_image(img_url)
+        return img_url
     
-    selected = random.choice(available)
-    track_used_image(selected)
-    return selected
+    # Fallback - первая картинка
+    if unique_images:
+        log.warning("   ⚠️ Все картинки плохие, беру первую")
+        img_url = unique_images[0]["url"]
+        track_used_image(img_url)
+        return img_url
+    
+    return None
 
 async def download_image(url: str):
     try:
@@ -623,23 +787,51 @@ async def download_image(url: str):
     return None
 
 def generate_smart_hashtags(title: str, description: str = "") -> str:
-    """Генерирует хештеги"""
+    """Генерирует КОРОТКИЕ односложные хештеги"""
     text = f"{title} {description}".lower()
     tags = []
     
-    if any(w in text for w in ['путин', 'кремл']): tags.append('#Путин')
+    # Персоны (односложные!)
+    if 'путин' in text: tags.append('#Путин')
     if 'трамп' in text: tags.append('#Трамп')
-    if 'сша' in text: tags.append('#США')
+    if 'байден' in text: tags.append('#Байден')
+    if 'зеленск' in text: tags.append('#Зеленский')
+    if 'кушнер' in text: tags.append('#Кушнер')
+    if 'уиткофф' in text: tags.append('#Уиткофф')
+    if 'макрон' in text: tags.append('#Макрон')
+    if 'си цзиньпин' in text or 'цзиньпин' in text: tags.append('#Китай')
+    
+    # Страны (односложные!)
+    if 'сша' in text or 'америк' in text: tags.append('#США')
     if 'украин' in text: tags.append('#Украина')
-    if any(w in text for w in ['рубль', 'доллар']): tags.append('#валюта')
-    if 'война' in text: tags.append('#война')
-    if any(w in text for w in ['взрыв', 'пожар']): tags.append('#ЧП')
-    if any(w in text for w in ['арест', 'суд']): tags.append('#криминал')
+    if 'росси' in text or ' рф ' in text: tags.append('#Россия')
+    if 'герман' in text: tags.append('#Германия')
+    if 'китай' in text or 'пекин' in text: tags.append('#Китай')
+    if 'москв' in text: tags.append('#Москва')
+    if 'давос' in text: tags.append('#Давос')
     
-    if not tags:
-        tags.append('#новости')
+    # Темы (односложные!)
+    if any(w in text for w in ['доллар', 'рубль', 'курс', 'валют']): tags.append('#Курс')
+    if any(w in text for w in ['экономик', 'санкци', 'пошлин']): tags.append('#Экономика')
+    if 'война' in text or 'конфликт' in text: tags.append('#Война')
+    if 'перегов' in text or 'встреч' in text or 'визит' in text: tags.append('#Переговоры')
+    if any(w in text for w in ['взрыв', 'пожар', 'авари']): tags.append('#ЧП')
+    if any(w in text for w in ['арест', 'суд', 'задерж']): tags.append('#Криминал')
+    if any(w in text for w in ['тюрьм', 'мигр', 'депорт']): tags.append('#Миграция')
+    if any(w in text for w in ['журнал', 'сми', 'газет']): tags.append('#СМИ')
     
-    return ' '.join(tags[:4])
+    # Убираем дубликаты
+    seen = set()
+    unique = []
+    for tag in tags:
+        if tag.lower() not in seen:
+            seen.add(tag.lower())
+            unique.append(tag)
+    
+    if not unique:
+        unique.append('#Новости')
+    
+    return ' '.join(unique[:4])
 
 # ================== ПОСТИНГ ==================
 async def post_selected_news(news):
@@ -651,48 +843,37 @@ async def post_selected_news(news):
     rss_image = news.get("rss_image")
     
     hashtags = re.sub(r'@\w+', '', hashtags).strip()
-    
     if not hashtags:
         hashtags = generate_smart_hashtags(title, desc)
     
-    # ФОРМАТ КАК ТЫ ХОЧЕШЬ
     caption = f"**{title}**\n\n{summary}\n\n{hashtags}"
     
     log.info(f"   📰 ПОСТ:")
     log.info(f"   Заголовок: {title}")
-    log.info(f"   Пересказ: {summary[:100]}...")
     log.info(f"   Хештеги: {hashtags}")
     
-    log.info(f"   🎨 Ищу идеальную картинку...")
     img_url = await get_perfect_image(title, desc, rss_image)
+    
+    if not img_url:
+        log.warning("   ⚠️ Картинка не найдена, пропускаем пост")
+        return False
     
     img_data = await download_image(img_url)
     
-    for attempt in range(3):
+    if img_data and len(img_data) > 1024:
         try:
-            if img_data and len(img_data) > 1024:
-                file = BufferedInputFile(img_data, filename="news.jpg")
-                await bot.send_photo(CHANNEL_ID, file, caption=caption, parse_mode=ParseMode.MARKDOWN)
-            else:
-                if attempt == 0:
-                    log.warning("   ⚠️ Битая картинка, пробую fallback")
-                    img_url = get_fallback_image(f"{title} {desc}".lower())
-                    img_data = await download_image(img_url)
-                    continue
-                else:
-                    await bot.send_message(CHANNEL_ID, caption, parse_mode=ParseMode.MARKDOWN)
-            
+            file = BufferedInputFile(img_data, filename="news.jpg")
+            await bot.send_photo(CHANNEL_ID, file, caption=caption, parse_mode=ParseMode.MARKDOWN)
             save_posted(news["title"], url)
             increment_stat()
             log.info(f"✅ Опубликовано: {title[:50]}")
             return True
         except Exception as e:
-            if attempt == 2:
-                log.error(f"❌ Ошибка: {e}")
-                return False
-            await asyncio.sleep(2)
-    
-    return False
+            log.error(f"❌ Ошибка: {e}")
+            return False
+    else:
+        log.warning("   ⚠️ Битая картинка")
+        return False
 
 # ================== ЦИКЛ ==================
 async def check_news():
@@ -728,7 +909,7 @@ async def news_loop():
         log.info(f"⏰ Следующий пост через {next_interval} мин")
         await asyncio.sleep(next_interval * 60)
 
-# ================== YOUTUBE ==================
+# ================== YOUTUBE SHORTS - УЛУЧШЕННЫЙ ==================
 def has_cyrillic(text):
     return bool(re.search('[а-яА-ЯёЁ]', text))
 
@@ -798,23 +979,38 @@ def format_views(views):
         return str(views)
 
 async def search_diverse_shorts():
-    log.info("🔍 Поиск разнообразных Shorts...")
+    """УЛУЧШЕННЫЙ поиск с РОТАЦИЕЙ каналов"""
+    log.info("🔍 Поиск РАЗНООБРАЗНЫХ Shorts...")
+    
+    # Получаем недавно использованные каналы
+    recent_channels = get_recent_channels(hours=12)
+    log.info(f"   ⏭️ Исключаю {len(recent_channels)} недавних каналов: {recent_channels[:5]}...")
     
     all_shorts = []
+    
+    # РАСШИРЕННЫЙ список запросов для разнообразия
     diverse_queries = [
         "новости россии сегодня",
         "политика путин кремль",
         "путин заявил",
         "трамп новости",
-        "украина война новости",
         "мировые новости",
         "курс доллара рубль",
         "экономика россии",
         "россия происшествия",
         "важные новости дня",
+        "срочные новости",
+        "итоги недели россия",
+        "главное за день",
+        "политические новости",
+        "международные отношения",
+        "скандал россия",
     ]
     
-    for query in diverse_queries[:8]:
+    # Перемешиваем запросы для разнообразия
+    random.shuffle(diverse_queries)
+    
+    for query in diverse_queries[:10]:
         try:
             log.info(f"   🔎 '{query}'...")
             
@@ -823,8 +1019,8 @@ async def search_diverse_shorts():
                 "part": "id,snippet",
                 "q": query + " shorts",
                 "type": "video",
-                "maxResults": 40,
-                "order": "viewCount",
+                "maxResults": 50,  # Увеличил
+                "order": "date",   # ИЗМЕНИЛ: сначала по дате, потом фильтруем
                 "publishedAfter": (datetime.now() - timedelta(days=3)).isoformat() + "Z",
                 "regionCode": "RU",
                 "relevanceLanguage": "ru",
@@ -873,6 +1069,17 @@ async def search_diverse_shorts():
                                 channel_title = snippet.get("channelTitle", "")
                                 description = snippet.get("description", "")
                                 
+                                # ПРОВЕРКА: канал уже использовался недавно?
+                                if channel_title.lower() in recent_channels:
+                                    log.debug(f"      ⏭️ Пропуск (недавний канал): {channel_title}")
+                                    continue
+                                
+                                # Проверяем сколько раз использовали канал за 24ч
+                                channel_usage = get_channel_usage_count(channel_title, hours=24)
+                                if channel_usage >= 2:  # Максимум 2 видео с одного канала в день
+                                    log.debug(f"      ⏭️ Пропуск (лимит канала): {channel_title} ({channel_usage}/2)")
+                                    continue
+                                
                                 if not is_russian_content(title, channel_title, description):
                                     continue
                                 
@@ -881,7 +1088,7 @@ async def search_diverse_shorts():
                                 
                                 views = int(stats.get("viewCount", 0))
                                 
-                                min_views = 2000 if is_trusted_news_channel(channel_title) else 5000
+                                min_views = 1000 if is_trusted_news_channel(channel_title) else 3000
                                 if views < min_views:
                                     continue
                                 
@@ -905,6 +1112,7 @@ async def search_diverse_shorts():
             log.warning(f"   ⚠️ Ошибка поиска '{query}': {e}")
             continue
     
+    # Убираем дубликаты видео
     seen_ids = set()
     unique_shorts = []
     for short in all_shorts:
@@ -912,9 +1120,22 @@ async def search_diverse_shorts():
             seen_ids.add(short["id"])
             unique_shorts.append(short)
     
-    unique_shorts.sort(key=lambda x: (not x["is_trusted"], -x["views"]))
+    # НОВАЯ СОРТИРОВКА: приоритет каналам которые давно не использовались + просмотры
+    def sort_key(x):
+        channel_usage = get_channel_usage_count(x["channel"], hours=48)
+        # Чем меньше использовали - тем выше приоритет
+        # Trusted каналы всё ещё имеют бонус
+        return (channel_usage, not x["is_trusted"], -x["views"])
     
-    log.info(f"✅ Найдено {len(unique_shorts)} разнообразных Shorts")
+    unique_shorts.sort(key=sort_key)
+    
+    log.info(f"✅ Найдено {len(unique_shorts)} РАЗНООБРАЗНЫХ Shorts")
+    
+    # Показываем топ-5 для отладки
+    for i, s in enumerate(unique_shorts[:5], 1):
+        usage = get_channel_usage_count(s["channel"], hours=24)
+        log.info(f"   {i}. [{s['channel'][:20]}] (использований: {usage}) - {s['title'][:40]}...")
+    
     return unique_shorts
 
 async def download_shorts_video(video_id):
@@ -965,7 +1186,8 @@ async def download_shorts_video(video_id):
         return None
 
 async def post_youtube_shorts():
-    log.info("🎬 Запуск: YouTube Shorts (19:00)...")
+    """ОБНОВЛЁННЫЙ постинг Shorts с НОВЫМ форматом"""
+    log.info("🎬 Запуск: YouTube Shorts...")
     
     shorts = await search_diverse_shorts()
     
@@ -973,13 +1195,13 @@ async def post_youtube_shorts():
         log.warning("⚠️ Shorts не найдены")
         return
     
-    for i, short_video in enumerate(shorts[:10], 1):
+    for i, short_video in enumerate(shorts[:15], 1):  # Увеличил до 15 попыток
         if is_youtube_posted_today(short_video["id"]):
-            log.info(f"   [{i}/10] ⏭️ Пропуск (уже постили): {short_video['title'][:50]}")
+            log.info(f"   [{i}/15] ⏭️ Пропуск (уже постили): {short_video['title'][:50]}")
             continue
         
         trust_badge = "⭐" if short_video["is_trusted"] else ""
-        log.info(f"🎯 [{i}/10] {trust_badge} {short_video['title'][:60]}...")
+        log.info(f"🎯 [{i}/15] {trust_badge} {short_video['title'][:60]}...")
         log.info(f"   👀 {format_views(short_video['views'])} | 📺 {short_video['channel']}")
         
         video_file_path = await download_shorts_video(short_video['id'])
@@ -989,9 +1211,23 @@ async def post_youtube_shorts():
             continue
         
         try:
+            # ================== НОВЫЙ ФОРМАТ ПОСТА ==================
+            # Убираем "Главный новостной Short дня" и хештеги после //
+            # Просто: название + канал + статистика
+            
+            # Очищаем название от лишнего
+            clean_title = short_video['title']
+            # Убираем хештеги из названия если есть
+            clean_title = re.sub(r'#\S+', '', clean_title).strip()
+            # Убираем // и всё после
+            if '//' in clean_title:
+                clean_title = clean_title.split('//')[0].strip()
+            # Убираем | и всё после
+            if '|' in clean_title:
+                clean_title = clean_title.split('|')[0].strip()
+            
             caption = (
-                f"⚡ **Главный новостной Shorts дня**\n\n"
-                f"**{short_video['title']}**\n\n"
+                f"❗ {clean_title}\n\n"
                 f"📺 {short_video['channel']}\n"
                 f"👀 {format_views(short_video['views'])} просмотров | "
                 f"❤️ {format_views(short_video['likes'])}\n\n"
@@ -1017,7 +1253,9 @@ async def post_youtube_shorts():
             )
             
             save_youtube_posted(short_video['id'], 'shorts')
-            log.info("✅ YouTube Shorts опубликован!")
+            # ВАЖНО: отслеживаем использованный канал
+            track_youtube_channel(short_video['channel'])
+            log.info(f"✅ YouTube Shorts опубликован! (канал: {short_video['channel']})")
             
             os.remove(video_file_path)
             log.info(f"🗑️ Файл удалён: {video_file_path}")
@@ -1033,7 +1271,7 @@ async def post_youtube_shorts():
             
             continue
     
-    log.warning("⚠️ Не удалось запостить ни один Shorts из топ-10")
+    log.warning("⚠️ Не удалось запостить ни один Shorts из топ-15")
     return False
 
 def cleanup_old_files():
@@ -1055,7 +1293,7 @@ def cleanup_old_files():
 async def main():
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     
-    # YouTube Shorts - 3 раза в день (утро, вечер, ночь)
+    # YouTube Shorts - 3 раза в день
     scheduler.add_job(post_youtube_shorts, "cron", hour=9, minute=0, name="shorts_morning")
     scheduler.add_job(post_youtube_shorts, "cron", hour=19, minute=0, name="shorts_evening")
     scheduler.add_job(post_youtube_shorts, "cron", hour=22, minute=0, name="shorts_night")
@@ -1066,17 +1304,17 @@ async def main():
     scheduler.start()
     
     log.info("=" * 70)
-    log.info("🤖 НОВОСТНОЙ БОТ ЗАПУЩЕН")
+    log.info("🤖 НОВОСТНОЙ БОТ v2.0 - УЛУЧШЕННЫЙ")
     log.info("=" * 70)
     log.info("📰 Новости: каждые 20-70 мин (макс 25/день)")
     log.info("🎬 YouTube Shorts: 3 раза в день (9:00, 19:00, 22:00)")
-    log.info("🎨 Картинки:")
-    log.info("    1️⃣ Приоритет: из RSS фида")
-    log.info("    2️⃣ Fallback: тематический пул Unsplash")
-    log.info("    ⚠️ Unsplash API отключён (нет ключа)")
-    log.info("🤖 AI: язвительные пересказы (OpenRouter)")
-    log.info("♻️ Ротация: никаких повторов 24 часа")
-    log.info(f"📡 RSS источников: {len(RSS_SOURCES)}")
+    log.info("")
+    log.info("🆕 ЧТО НОВОГО:")
+    log.info("   ✅ Ротация каналов YouTube (макс 2 видео/канал/день)")
+    log.info("   ✅ Новый формат Shorts постов (без 'Главный Short дня')")
+    log.info("   ✅ Улучшенный поиск картинок (конкретные персоны)")
+    log.info("   ✅ До 5 запросов к Unsplash для лучших результатов")
+    log.info("   ✅ Расширенный список новостных каналов")
     log.info("=" * 70)
     
     await news_loop()
