@@ -1,0 +1,10 @@
+aiogram==3.4.1
+feedparser==6.0.10
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+apscheduler==3.10.4
+python-dotenv==1.0.0
+matplotlib==3.8.2
+pytz==2023.3
+yt-dlp==2023.12.30
+lxml==4.9.3
