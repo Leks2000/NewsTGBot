@@ -35,3 +35,10 @@
 |--------------------|---------------------|
 | <img width="1747" height="1122" alt="image" src="https://github.com/user-attachments/assets/82798eca-b742-4a64-9310-a3c733d379e3" /> | <img width="850" height="1122" alt="image" src="https://github.com/user-attachments/assets/cdce5a03-ff93-4f2c-9278-aae3894fe797" /> |
 
+API ключи брать тут или обновлять 
+Картинки:
+https://unsplash.com/oauth/applications/861004
+https://www.pexels.com/api/key/
+
+Youtube api for search shorts:
+https://console.cloud.google.com/welcome?authuser=2&project=newstg0bot
